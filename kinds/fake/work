@@ -1,0 +1,21 @@
+#!/bin/bash
+# fake work: N units, a checkpoint every 5, resumable, checkpoints on TERM.
+N=${1:-30}; S=${FAKE_SLEEP:-0.5}; MODE=${FAKE_MODE:-push}
+i=0
+if [ "$W_RESUME" = 1 ] && [ -n "$W_CKPT_UNIT" ]; then i=$W_CKPT_UNIT; echo "resuming at unit $i (checkpoint)"; fi
+trap 'echo "TERM at unit $i: checkpointing"; echo "::checkpoint unit=$i"; exit 143' TERM
+echo "::phase work"
+while [ "$i" -lt "$N" ]; do
+  i=$((i+1))
+  sleep "$S" & wait $!
+  case $MODE in
+    push)  echo "::progress done=$i total=$N unit=units msg=\"unit $i\"" ;;
+    regex) echo "frame $i of $N" ;;
+    poll)  echo "$i" > "$W_STATE/count" ;;
+  esac
+  [ $((i % 5)) = 0 ] && echo "::checkpoint unit=$i"
+  [ "$i" = "${FAKE_FAIL:-x}" ] && { echo "error: fake failure at unit $i" >&2; exit 3; }
+  [ "$i" = "${FAKE_ASK:-x}" ] && gaffer emit needs-you "unit $i wants a decision"
+  [ "$i" = "${FAKE_HANG:-x}" ] && { echo "hanging at unit $i"; sleep 100000 & wait $!; }
+done
+echo "work done: $N units"

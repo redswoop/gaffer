@@ -1,0 +1,4 @@
+#!/bin/bash
+# Only speak when there's something to say: a poll that prints done=0 would overwrite pushed progress.
+[ -f "$W_STATE/count" ] && echo "::progress done=$(cat "$W_STATE/count") total=${1:-30} unit=units msg=polled"
+exit 0

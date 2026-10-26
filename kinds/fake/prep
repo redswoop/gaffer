@@ -1,0 +1,4 @@
+#!/bin/bash
+echo "::phase prep"
+echo "prep: checking inputs"
+sleep 1

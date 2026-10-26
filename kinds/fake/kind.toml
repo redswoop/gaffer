@@ -1,0 +1,22 @@
+# Test kind: exercises every progress path, checkpoints, TERM handling, failures, stalls, needs-you.
+#   FAKE_MODE=push|regex|poll  FAKE_SLEEP=sec/unit  FAKE_FAIL=N  FAKE_HANG=N  FAKE_ASK=N
+title = "fake {{1}} units"
+on_interrupt = "resume"
+stop_grace = 5
+stall_after = 20
+review = true
+progress_regex = 'frame (?P<done>\d+) of (?P<total>\d+)'
+progress_poll = '$W_KIND_DIR/poll "$@"'
+poll_every = 5
+
+[[steps]]
+name = "prep"
+run = '$W_KIND_DIR/prep'
+
+[[steps]]
+name = "work"
+run = '$W_KIND_DIR/work "$@"'
+
+[[steps]]
+name = "verify"
+run = '$W_KIND_DIR/verify'

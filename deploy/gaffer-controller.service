@@ -1,0 +1,11 @@
+[Unit]
+Description=gaffer controller (queue, scheduler, alerts, API on the tailnet)
+After=network-online.target tailscaled.service
+
+[Service]
+ExecStart=%h/.local/bin/gaffer controller
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

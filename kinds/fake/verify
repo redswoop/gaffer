@@ -1,0 +1,4 @@
+#!/bin/bash
+echo "::phase verify"
+sleep 1
+echo "verified"

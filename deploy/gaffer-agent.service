@@ -1,0 +1,14 @@
+[Unit]
+Description=gaffer agent (runs jobs on this host)
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/gaffer agent
+Restart=always
+RestartSec=5
+# Steps run detached under setsid in this cgroup; restarting the agent must not take them down.
+KillMode=process
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
