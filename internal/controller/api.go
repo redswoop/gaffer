@@ -32,6 +32,15 @@ func (c *Controller) routes() http.Handler {
 	m.HandleFunc("GET /api/stream", c.stream)
 	m.HandleFunc("POST /api/items", c.submit)
 	m.HandleFunc("POST /api/track", c.track)
+	m.HandleFunc("POST /api/observe/{name}", func(w http.ResponseWriter, r *http.Request) {
+		var req proto.ObserveReq
+		if err := json.NewDecoder(io.LimitReader(r.Body, 16<<20)).Decode(&req); err != nil || r.PathValue("name") == "" {
+			http.Error(w, "bad observe", 400)
+			return
+		}
+		c.observe(r.PathValue("name"), req)
+		reply(w, map[string]bool{"ok": true})
+	})
 	m.HandleFunc("GET /api/items/{id}", func(w http.ResponseWriter, r *http.Request) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -187,6 +196,9 @@ func (c *Controller) verb(w http.ResponseWriter, r *http.Request) {
 // command racing a state change fails loudly instead of clobbering it.
 func (c *Controller) apply(it *rec, verb, body string) (string, error) {
 	bad := func() (string, error) { return "", fmt.Errorf("#%d is %s; can't %s", it.ID, it.State, verb) }
+	if it.Source != "" && verb != "ack" && verb != "cancel" && verb != "top" && verb != "do" {
+		return "", fmt.Errorf("#%d is reported by the %s observer; %s it there (cancel just dismisses it here)", it.ID, it.Source, verb)
+	}
 	switch verb {
 	case "pause":
 		switch it.State {
@@ -206,10 +218,10 @@ func (c *Controller) apply(it *rec, verb, body string) (string, error) {
 	case "cancel":
 		switch it.State {
 		case proto.SQueued, proto.SHeld, proto.SPaused, proto.SNeedsYou, proto.SFailed:
-			it.State, it.Finished = proto.SCanceled, nowMS()
+			it.State, it.Finished, it.Reason, it.Attention = proto.SCanceled, nowMS(), "canceled", ""
 		case proto.SAssigned, proto.SRunning, proto.SStopping:
 			if it.Observed {
-				it.State, it.Finished = proto.SCanceled, nowMS()
+				it.State, it.Finished, it.Reason, it.Attention = proto.SCanceled, nowMS(), "canceled", ""
 				break
 			}
 			it.StopMode = "cancel"
@@ -228,7 +240,7 @@ func (c *Controller) apply(it *rec, verb, body string) (string, error) {
 		if it.State != proto.SFailed && it.State != proto.SCanceled && it.State != proto.SDone {
 			return bad()
 		}
-		it.State, it.Reason, it.Retries, it.Finished, it.Affinity = proto.SQueued, "", 0, 0, ""
+		it.State, it.Reason, it.Retries, it.Finished, it.Affinity, it.Acked = proto.SQueued, "", 0, 0, "", 0
 		if strings.TrimSpace(body) != "resume" {
 			it.Step, it.Resume, it.Checkpoint, it.Progress = 0, false, nil, nil
 			c.db.Exec("DELETE FROM samples WHERE item=?", it.ID)
@@ -236,12 +248,19 @@ func (c *Controller) apply(it *rec, verb, body string) (string, error) {
 			it.Resume = true
 		}
 	case "ack":
+		if it.State == proto.SFailed && it.Acked == 0 { // seen it: it stays failed, just off the FAILED list
+			it.Acked = nowMS()
+			break
+		}
 		if it.Attention == "" && it.State != proto.SNeedsYou {
 			return bad()
 		}
 		it.AttentionAcked, it.Attention = it.Attention, ""
 		if it.State == proto.SNeedsYou {
 			it.State = proto.SDone
+			if it.Finished == 0 {
+				it.Finished = nowMS() // or it would never show again, not even in `ls -a`
+			}
 		}
 	case "top":
 		var m int
@@ -249,6 +268,8 @@ func (c *Controller) apply(it *rec, verb, body string) (string, error) {
 		it.Priority = m - 1
 	case "emit":
 		return c.emit(it, body)
+	case "do":
+		return c.act(it, strings.TrimSpace(body))
 	default:
 		return "", fmt.Errorf("unknown verb %s", verb)
 	}
@@ -273,10 +294,10 @@ func (c *Controller) emit(it *rec, body string) (string, error) {
 		l := strings.TrimSpace(sc.Text())
 		switch {
 		case l == "::done":
-			it.State, it.Finished = proto.SDone, t
+			it.State, it.Finished, ps.Attention = proto.SDone, t, ""
 		case strings.HasPrefix(l, "::fail"):
-			it.State, it.Finished, it.Reason = proto.SFailed, t, strings.TrimSpace(strings.TrimPrefix(l, "::fail"))
-			c.alert("gaffer: FAILED #"+itoa(it.ID), it.Title+"\n"+it.Reason, "high", "warning")
+			it.State, it.Finished, it.Reason, ps.Attention = proto.SFailed, t, strings.TrimSpace(strings.TrimPrefix(l, "::fail")), ""
+			c.alertFor(it, "gaffer: FAILED #"+itoa(it.ID), it.Title+"\n"+it.Reason, "high", "warning")
 		default:
 			ps.Line(l, nil, t)
 		}

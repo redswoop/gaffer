@@ -113,6 +113,9 @@ func (j *job) env(dir string, step int) []string {
 		}
 	}
 	for k, v := range j.Spec.Env {
+		if k == "PATH" { // a job's own PATH (gaffer run carries yours) still finds `gaffer emit`
+			v = filepath.Dir(exe) + ":" + v
+		}
 		env = append(env, k+"="+v)
 	}
 	return env

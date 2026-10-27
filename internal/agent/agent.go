@@ -42,14 +42,21 @@ type Agent struct {
 	polls   chan pollResult
 	client  *http.Client
 	synced  bool
+	obsLast map[string]int64
+	obsBusy map[string]bool
+	obsDone chan string
 }
 
 func now() int64 { return time.Now().UnixMilli() }
 
 func Run(cfg *config.Config) error {
 	a := &Agent{cfg: cfg, host: cfg.Agent.Host, dir: cfg.Agent.Dir, jobs: map[int64]*job{}, logHave: map[int64]int64{},
-		polls: make(chan pollResult, 16), client: &http.Client{Timeout: 15 * time.Second}}
+		polls: make(chan pollResult, 16), client: &http.Client{Timeout: 15 * time.Second},
+		obsLast: map[string]int64{}, obsBusy: map[string]bool{}, obsDone: make(chan string, 16)}
 	a.exe, _ = os.Executable()
+	if len(cfg.Agent.Path) > 0 {
+		os.Setenv("PATH", strings.Join(cfg.Agent.Path, ":")+":"+os.Getenv("PATH"))
+	}
 	if err := os.MkdirAll(filepath.Join(a.dir, "jobs"), 0o755); err != nil {
 		return err
 	}
@@ -71,6 +78,7 @@ func Run(cfg *config.Config) error {
 	for {
 		t := now()
 		a.drainPolls(t)
+		a.observe(t)
 		for _, j := range a.jobs {
 			a.tick(j, t)
 			if j.dirty && (j.State != proto.JRunning || t-j.lastSave() > 2000) {
@@ -216,7 +224,7 @@ func (a *Agent) start(as proto.Assign) {
 		j.TailOff = j.logSize() // don't re-read earlier attempts
 	}
 	j.Attempt, j.Spec, j.Host, j.State, j.Step = as.Attempt, as.Spec, a.host, proto.JRunning, as.Step
-	j.KindDir = filepath.Join(a.cfg.Kinds, as.Spec.Kind)
+	j.KindDir = a.cfg.KindDir(as.Spec.Kind)
 	j.Resume, j.ResumeStep = as.Resume, as.Step
 	j.StopMode, j.StopAt, j.RC, j.Reason, j.Started, j.Finished, j.Acked = "", 0, 0, "", t, 0, false
 	j.P.Attention = ""
@@ -302,8 +310,58 @@ func (a *Agent) drainPolls(t int64) {
 	}
 }
 
+// observe starts each due observer; the goroutine posts its result straight to the controller. A
+// failed run is reported as a failure, never as an empty snapshot (which would mean "all gone").
+func (a *Agent) observe(t int64) {
+	for drained := false; !drained; {
+		select {
+		case name := <-a.obsDone:
+			a.obsBusy[name] = false
+		default:
+			drained = true
+		}
+	}
+	for _, o := range a.cfg.Agent.Observe {
+		every := max(o.Every, 2)
+		if o.Name == "" || o.Run == "" || a.obsBusy[o.Name] || t-a.obsLast[o.Name] < int64(every)*1000 {
+			continue
+		}
+		a.obsBusy[o.Name], a.obsLast[o.Name] = true, t
+		exe := a.exe
+		go func() {
+			defer func() { a.obsDone <- o.Name }()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(max(every, 60))*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "bash", "-c", o.Run)
+			cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(exe)+":"+os.Getenv("PATH"), "W_HOST="+a.host)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			req := proto.ObserveReq{Host: a.host, Every: every, OK: true, Actions: o.Actions}
+			if err := cmd.Run(); err != nil {
+				lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+				req.OK, req.Error = false, trunc(strings.TrimSpace(err.Error()+": "+lines[len(lines)-1]), 300)
+			} else {
+				req.Out = stdout.String()
+			}
+			body, _ := json.Marshal(req)
+			hr, _ := http.NewRequest("POST", strings.TrimRight(a.cfg.Controller, "/")+"/api/observe/"+o.Name, bytes.NewReader(body))
+			hr.Header.Set("Authorization", "Bearer "+a.cfg.Token)
+			hr.Header.Set("Content-Type", "application/json")
+			if res, err := a.client.Do(hr); err != nil {
+				log.Printf("observe %s: %v", o.Name, err)
+			} else {
+				res.Body.Close()
+			}
+		}()
+	}
+}
+
 func (a *Agent) sync() error {
-	req := proto.SyncReq{Host: a.host, BootID: bootID(), Version: Version, Slots: a.cfg.Agent.Slots, Jobs: []proto.JobReport{}}
+	req := proto.SyncReq{Host: a.host, BootID: bootID(), Version: Version, Slots: a.cfg.Agent.Slots, Jobs: []proto.JobReport{},
+		Observers: []string{}}
+	for _, o := range a.cfg.Agent.Observe {
+		req.Observers = append(req.Observers, o.Name)
+	}
 	ids := make([]int64, 0, len(a.jobs))
 	for id, j := range a.jobs {
 		if !j.Acked {

@@ -41,15 +41,21 @@ systemctl --user restart gaffer-agent.service
 
 # Remotes need no root and no linger: the agent dials out over HTTP. A cron line keeps it up across
 # reboots, since the agent refuses to run twice: `* * * * * $REMOTE_DATA/bin/gaffer agent >>$REMOTE_DATA/agent.log 2>&1`
+mapfile -t KDIRS < <(./gaffer kinds --dirs)
 for R in $REMOTES; do
   D=$REMOTE_DATA
-  ssh "$R" "mkdir -p $D/bin ~/.config/gaffer"
+  ssh "$R" "mkdir -p $D/bin $D/kinds ~/.config/gaffer ~/.local/bin && ln -sfn $D/bin/gaffer ~/.local/bin/gaffer"   # ssh there, run gaffer there
   rsync -a gaffer "$R:$D/bin/gaffer.new" && ssh "$R" "mv -f $D/bin/gaffer.new $D/bin/gaffer"
-  rsync -a --delete kinds/ "$R:$D/kinds/"
+  RK=""   # every local kinds dir, in lookup order, as $D/kinds/0, 1, ...
+  for i in "${!KDIRS[@]}"; do
+    rsync -a --delete "${KDIRS[$i]}/" "$R:$D/kinds/$i/"
+    RK="$RK${RK:+, }\"$D/kinds/$i\""
+  done
+  ssh "$R" "cd $D/kinds && for e in *; do case \$e in *[!0-9]*) rm -rf -- \"\$e\";; *) [ \"\$e\" -lt ${#KDIRS[@]} ] || rm -rf -- \"\$e\";; esac; done"
   ssh "$R" "cat > ~/.config/gaffer/config.toml" <<EOT
 controller = "http://$IP:8097"
 data = "$D"
-kinds = "$D/kinds"
+kinds = [$RK]
 [agent]
 host = "$R"
 dir = "$D/agent"

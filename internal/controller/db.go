@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS samples(item INT, ts INT, done REAL);
 CREATE INDEX IF NOT EXISTS samples_item ON samples(item, ts);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, item INT, ts INT, kind TEXT, msg TEXT);
 CREATE INDEX IF NOT EXISTS events_item ON events(item, ts);
+CREATE TABLE IF NOT EXISTS sources(name TEXT PRIMARY KEY, host TEXT, every INT, seen INT, ok INT, error TEXT DEFAULT '',
+  alerted INT DEFAULT 0, actions TEXT DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS hosts(host TEXT PRIMARY KEY, boot_id TEXT, version TEXT, slots TEXT, seen INT,
   drained INT DEFAULT 0, failures INT DEFAULT 0, note TEXT DEFAULT '', offline_alerted INT DEFAULT 0);
 `
@@ -33,6 +35,7 @@ type rec struct {
 	Resume         bool
 	StopMode       string
 	Affinity       string // resume with a checkpoint must go back to the host that holds W_STATE
+	Offers         string // observed: the actions the source offers on it now, comma-separated
 	StallAlerted   bool
 	RejectHost     string
 	RejectUntil    int64
@@ -40,7 +43,7 @@ type rec struct {
 
 const cols = `id, kind, title, state, host, attempt, retries, step, step_name, priority, reason, attention, attention_acked,
   observed, progress, checkpoint, resume, stop_mode, affinity, stall_alerted, reject_host, reject_until, created, started,
-  finished, updated, spec`
+  finished, updated, spec, source, ext_key, parent, offers, acked`
 
 func openDB(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
@@ -49,6 +52,14 @@ func openDB(path string) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
+		return nil, err
+	}
+	for _, col := range []string{"items source TEXT DEFAULT ''", "items ext_key TEXT DEFAULT ''", "items parent INT DEFAULT 0",
+		"items offers TEXT DEFAULT ''", "sources actions TEXT DEFAULT '{}'", "items acked INT DEFAULT 0"} { // added after v0
+		table, def, _ := strings.Cut(col, " ")
+		db.Exec("ALTER TABLE " + table + " ADD COLUMN " + def) // fails harmlessly once it exists
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS items_ext ON items(source, ext_key)"); err != nil {
 		return nil, err
 	}
 	return db, nil
@@ -61,7 +72,7 @@ func scanRec(s scanner) (*rec, error) {
 	var prog, cp, spec sql.NullString
 	err := s.Scan(&r.ID, &r.Kind, &r.Title, &r.State, &r.Host, &r.Attempt, &r.Retries, &r.Step, &r.StepName, &r.Priority,
 		&r.Reason, &r.Attention, &r.AttentionAcked, &r.Observed, &prog, &cp, &r.Resume, &r.StopMode, &r.Affinity,
-		&r.StallAlerted, &r.RejectHost, &r.RejectUntil, &r.Created, &r.Started, &r.Finished, &r.Updated, &spec)
+		&r.StallAlerted, &r.RejectHost, &r.RejectUntil, &r.Created, &r.Started, &r.Finished, &r.Updated, &spec, &r.Source, &r.Key, &r.Parent, &r.Offers, &r.Acked)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +135,7 @@ func (c *Controller) put(r *rec) {
 	_, err := c.db.Exec("UPDATE items SET "+strings.Join(set, ", ")+" WHERE id=?",
 		r.Kind, r.Title, r.State, r.Host, r.Attempt, r.Retries, r.Step, r.StepName, r.Priority, r.Reason, r.Attention,
 		r.AttentionAcked, r.Observed, prog, cp, r.Resume, r.StopMode, r.Affinity, r.StallAlerted, r.RejectHost,
-		r.RejectUntil, r.Created, r.Started, r.Finished, r.Updated, js(r.Spec), r.ID)
+		r.RejectUntil, r.Created, r.Started, r.Finished, r.Updated, js(r.Spec), r.Source, r.Key, r.Parent, r.Offers, r.Acked, r.ID)
 	if err != nil {
 		logf("put #%d: %v", r.ID, err)
 	}

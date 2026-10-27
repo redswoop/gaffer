@@ -1,0 +1,9 @@
+#!/bin/bash
+# gaffer observer: one item while a ComfyUI queue has work in it. COMFY_URL defaults to the local one.
+# ComfyUI being down is normal (stopped to free the GPU), so unreachable reads as "nothing queued".
+set -uo pipefail
+q=$(curl -fsS -m 5 "${COMFY_URL:-http://127.0.0.1:8188}/queue") || exit 0
+r=$(jq '.queue_running | length' <<<"$q") p=$(jq '.queue_pending | length' <<<"$q")
+[ $((r + p)) -gt 0 ] || exit 0
+echo "::item queue title=\"ComfyUI queue\" kind=comfyui state=running"
+echo "::msg $r running, $p pending"

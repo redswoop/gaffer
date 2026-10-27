@@ -113,6 +113,9 @@ func (c *Controller) sync(req proto.SyncReq) proto.SyncResp {
 		c.alert("gaffer: "+req.Host+" back online", "", "low", "white_check_mark")
 	}
 
+	if req.Observers != nil {
+		c.retireSources(req.Host, req.Observers, t)
+	}
 	for _, ch := range req.Logs {
 		c.appendLog(ch)
 	}
@@ -141,7 +144,7 @@ func (c *Controller) sync(req proto.SyncReq) proto.SyncResp {
 			}
 			continue
 		}
-		if active(it.State) && it.Host == req.Host {
+		if active(it.State) && it.Host == req.Host && resp.LogHave[r.ID] >= r.LogSize { // settled = whole log here
 			c.finished(it, r, req.Host)
 		}
 		if resp.LogHave[r.ID] >= r.LogSize {
@@ -225,7 +228,7 @@ func (c *Controller) fold(it *rec, p *proto.Progress, cp *proto.Checkpoint, atte
 		if attention != "" && attention != it.AttentionAcked {
 			it.Attention = attention
 			c.event(it.ID, "needs-you", attention)
-			c.alert("gaffer: #"+itoa(it.ID)+" needs you", it.Title+"\n"+attention, "high", "raising_hand")
+			c.alertFor(it, "gaffer: #"+itoa(it.ID)+" needs you", it.Title+"\n"+attention, "high", "raising_hand")
 		} else if attention == "" {
 			it.Attention, it.AttentionAcked = "", ""
 		}
@@ -239,22 +242,20 @@ func (c *Controller) finished(it *rec, r proto.JobReport, host string) {
 	case proto.JDone:
 		it.State, it.Finished, it.Reason, it.Checkpoint, it.StopMode = proto.SDone, r.Finished, "", nil, ""
 		c.db.Exec("UPDATE hosts SET failures=0 WHERE host=?", host)
+		it.Attention = "" // a mid-run question nobody answered is moot once the job is over
 		if it.Spec.Review {
-			it.State = proto.SNeedsYou
-			if it.Attention == "" {
-				it.Attention = "review"
-			}
-			c.alert("gaffer: #"+itoa(it.ID)+" ready for review", it.Title, "default", "eyes")
+			it.State, it.Attention = proto.SNeedsYou, "review"
+			c.alertFor(it, "gaffer: #"+itoa(it.ID)+" ready for review", it.Title, "default", "eyes")
 		}
 		c.event(it.ID, it.State, "finished on "+host)
 	case proto.JFailed:
-		it.State, it.Finished, it.Reason, it.StopMode = proto.SFailed, r.Finished, r.Reason, ""
+		it.State, it.Finished, it.Reason, it.StopMode, it.Attention = proto.SFailed, r.Finished, r.Reason, "", ""
 		c.event(it.ID, "failed", r.Reason)
-		c.alert("gaffer: FAILED #"+itoa(it.ID)+" on "+host, it.Title+"\n"+r.Reason+"\ngaffer log "+itoa(it.ID), "high", "warning")
+		c.alertFor(it, "gaffer: FAILED #"+itoa(it.ID)+" on "+host, it.Title+"\n"+r.Reason+"\ngaffer log "+itoa(it.ID), "high", "warning")
 		c.breaker(host)
 	case proto.JStopped:
 		if it.StopMode == "cancel" {
-			it.State, it.Finished, it.Reason = proto.SCanceled, r.Finished, "canceled"
+			it.State, it.Finished, it.Reason, it.Attention = proto.SCanceled, r.Finished, "canceled", ""
 		} else {
 			it.State, it.Reason, it.Resume = proto.SPaused, "paused on "+host, true
 			if it.Checkpoint != nil {
@@ -272,6 +273,9 @@ func (c *Controller) finished(it *rec, r proto.JobReport, host string) {
 			it.State, it.Reason, it.StopMode = map[string]string{"cancel": proto.SCanceled, "pause": proto.SPaused}[it.StopMode], "", ""
 		}
 		it.Host = ""
+	}
+	if it.State != proto.SQueued {
+		c.childEvent(it)
 	}
 	c.put(it)
 }
@@ -296,7 +300,7 @@ func (c *Controller) interrupted(it *rec, host, why string, cp *proto.Checkpoint
 		c.put(it)
 		return
 	case "cancel":
-		it.State, it.Reason, it.Finished = proto.SCanceled, "canceled", nowMS()
+		it.State, it.Reason, it.Finished, it.Attention = proto.SCanceled, "canceled", nowMS(), ""
 		c.put(it)
 		return
 	}
@@ -304,7 +308,7 @@ func (c *Controller) interrupted(it *rec, host, why string, cp *proto.Checkpoint
 	switch {
 	case it.Retries > maxR:
 		it.State, it.Reason, it.Finished = proto.SFailed, fmt.Sprintf("interrupted %d times; last: %s", it.Retries, why), nowMS()
-		c.alert("gaffer: FAILED #"+itoa(it.ID), it.Title+"\n"+it.Reason, "high", "warning")
+		c.alertFor(it, "gaffer: FAILED #"+itoa(it.ID), it.Title+"\n"+it.Reason, "high", "warning")
 	case policy == "hold":
 		it.State, it.Reason = proto.SHeld, "interrupted on "+host+": "+why+" (hold policy; `gaffer resume`)"
 		it.Resume, it.Step = true, step
@@ -321,7 +325,10 @@ func (c *Controller) interrupted(it *rec, host, why string, cp *proto.Checkpoint
 	}
 	c.event(it.ID, "interrupted", host+": "+why+" -> "+it.State)
 	if it.State != proto.SFailed {
-		c.alert("gaffer: #"+itoa(it.ID)+" interrupted on "+host, it.Title+"\n"+it.Reason, "default", "zap")
+		c.alertFor(it, "gaffer: #"+itoa(it.ID)+" interrupted on "+host, it.Title+"\n"+it.Reason, "default", "zap")
+	}
+	if it.State != proto.SQueued {
+		c.childEvent(it)
 	}
 	c.put(it)
 }
@@ -344,7 +351,7 @@ func (c *Controller) schedule(req proto.SyncReq) []proto.Assign {
 		return nil
 	}
 	used := map[string]int{}
-	for _, it := range c.query("WHERE host=? AND state IN ('assigned','running','stopping')", req.Host) {
+	for _, it := range c.query("WHERE host=? AND state IN ('assigned','running','stopping') AND observed=0", req.Host) {
 		used[needs(it.Spec)]++
 	}
 	t := nowMS()
@@ -405,9 +412,10 @@ func (c *Controller) monitor() {
 				it.StallAlerted = true
 				c.put(it)
 				c.event(it.ID, "stalled", "no progress for "+dur(t-c.lastMove(it)))
-				c.alert("gaffer: #"+itoa(it.ID)+" stalled", it.Title+"\nno progress for "+dur(t-c.lastMove(it)), "default", "hourglass")
+				c.alertFor(it, "gaffer: #"+itoa(it.ID)+" stalled", it.Title+"\nno progress for "+dur(t-c.lastMove(it)), "default", "hourglass")
 			}
 		}
+		c.watchSources(t)
 		c.changed = false
 		c.mu.Unlock()
 		c.notify() // also keeps ETAs and host liveness fresh for watchers
@@ -442,6 +450,7 @@ func (c *Controller) stalled(it *rec, t int64) bool {
 // the first one, early on); a job's own ETA wins when it states one.
 func (c *Controller) derive(it *rec, t int64) proto.Item {
 	out := it.Item
+	out.Actions = c.offers(it)
 	out.Stalled = c.stalled(it, t)
 	out.LogSize = c.logSize(it.ID)
 	p := it.Progress
@@ -472,7 +481,7 @@ func (c *Controller) status(all bool) proto.Status {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	t := nowMS()
-	st := proto.Status{Now: t, Hosts: []proto.Host{}, Items: []proto.Item{}}
+	st := proto.Status{Now: t, Hosts: []proto.Host{}, Sources: c.sources(t), Items: []proto.Item{}}
 	rows, err := c.db.Query("SELECT host, boot_id, version, slots, seen, drained, note, failures FROM hosts ORDER BY host")
 	if err == nil {
 		for rows.Next() {
@@ -486,7 +495,7 @@ func (c *Controller) status(all bool) proto.Status {
 		}
 		rows.Close()
 	}
-	where := "WHERE state NOT IN ('done','canceled') OR finished > ?"
+	where := "WHERE (state NOT IN ('done','canceled') AND NOT (state='failed' AND acked>0)) OR finished > ?"
 	cut := t - 24*3600*1000
 	if all {
 		cut = 0
@@ -494,7 +503,7 @@ func (c *Controller) status(all bool) proto.Status {
 	for _, it := range c.query(where, cut) {
 		st.Items = append(st.Items, c.derive(it, t))
 		for i := range st.Hosts {
-			if st.Hosts[i].Host == it.Host && active(it.State) {
+			if st.Hosts[i].Host == it.Host && active(it.State) && !it.Observed {
 				st.Hosts[i].Used[needs(it.Spec)]++
 			}
 		}
@@ -520,7 +529,7 @@ func rank(it proto.Item) int {
 		return 0
 	case it.State == proto.SNeedsYou:
 		return 1
-	case it.State == proto.SFailed:
+	case it.State == proto.SFailed && it.Acked == 0:
 		return 2
 	case it.Stalled:
 		return 3
@@ -532,6 +541,15 @@ func rank(it proto.Item) int {
 		return 6
 	}
 	return 7
+}
+
+// alertFor is an item's push, unless the item is quiet (something else already pings for it).
+func (c *Controller) alertFor(it *rec, title, msg, prio, tags string) {
+	if it.Spec.Quiet {
+		logf("quiet #%d %s", it.ID, title)
+		return
+	}
+	c.alert(title, msg, prio, tags)
 }
 
 func (c *Controller) alert(title, msg, prio, tags string) {
@@ -569,6 +587,9 @@ func dur(ms int64) string {
 	d := time.Duration(ms) * time.Millisecond
 	if d >= time.Hour {
 		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
 	}
 	return fmt.Sprintf("%dm", int(d.Minutes()))
 }

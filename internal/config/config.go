@@ -20,14 +20,46 @@ type Config struct {
 	Listen     string `toml:"listen"`     // controller bind; "auto:PORT" = tailscale IP, else 127.0.0.1
 	Data       string `toml:"data"`       // controller: db + logs
 	TokenFile  string `toml:"token_file"`
-	Ntfy       string `toml:"ntfy"` // full topic URL; empty = no pushes
-	Kinds      string `toml:"kinds"`
+	Ntfy       string `toml:"ntfy"`  // full topic URL; empty = no pushes
+	Kinds      Dirs   `toml:"kinds"` // one dir or a list; a kind's name resolves to the first dir that has it
 	Agent      struct {
-		Host  string         `toml:"host"`
-		Dir   string         `toml:"dir"`
-		Slots map[string]int `toml:"slots"`
+		Host    string         `toml:"host"`
+		Dir     string         `toml:"dir"`
+		Slots   map[string]int `toml:"slots"`
+		Path    Dirs           `toml:"path"` // put in front of PATH for everything the agent runs (a unit's PATH is bare)
+		Observe []Observer     `toml:"observe"`
 	} `toml:"agent"`
 	Token string `toml:"-"`
+}
+
+// Dirs takes `kinds = "/a"` as well as `kinds = ["/a", "/b"]`.
+type Dirs []string
+
+func (d *Dirs) UnmarshalTOML(v any) error {
+	switch x := v.(type) {
+	case string:
+		*d = Dirs{x}
+	case []any:
+		for _, e := range x {
+			s, ok := e.(string)
+			if !ok {
+				return fmt.Errorf("kinds: want strings, got %T", e)
+			}
+			*d = append(*d, s)
+		}
+	default:
+		return fmt.Errorf("kinds: want a string or a list, got %T", v)
+	}
+	return nil
+}
+
+// Observer is a script an agent runs every `every` seconds to report work gaffer doesn't run: its
+// output is a full snapshot of that source (::item lines, see README), reconciled by the controller.
+type Observer struct {
+	Name    string            `toml:"name"`
+	Run     string            `toml:"run"`
+	Every   int               `toml:"every"`
+	Actions map[string]string `toml:"actions"` // offered per item by the snapshot's actions=a,b
 }
 
 func Path() string {
@@ -52,10 +84,13 @@ func Load() (*Config, error) {
 	if _, err := toml.DecodeFile(Path(), c); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("%s: %w", Path(), err)
 	}
-	c.Data, c.TokenFile, c.Kinds, c.Agent.Dir = expand(c.Data), expand(c.TokenFile), expand(c.Kinds), expand(c.Agent.Dir)
-	if c.Kinds == "" {
+	c.Data, c.TokenFile, c.Agent.Dir = expand(c.Data), expand(c.TokenFile), expand(c.Agent.Dir)
+	for i := range c.Kinds {
+		c.Kinds[i] = expand(c.Kinds[i])
+	}
+	if len(c.Kinds) == 0 {
 		exe, _ := os.Executable()
-		c.Kinds = filepath.Join(filepath.Dir(exe), "kinds")
+		c.Kinds = Dirs{filepath.Join(filepath.Dir(exe), "kinds")}
 	}
 	if c.Agent.Host == "" {
 		c.Agent.Host, _ = os.Hostname()
@@ -119,13 +154,28 @@ type Kind struct {
 	PollEvery     int               `toml:"poll_every"`
 	Fits          string            `toml:"fits"`
 	Review        bool              `toml:"review"`
+	Quiet         bool              `toml:"quiet"`
+	Actions       map[string]string `toml:"actions"`
 	MaxRetries    int               `toml:"max_retries"`
+}
+
+// KindDir is the first kinds dir that has <name>/kind.toml ("" if none does).
+func (c *Config) KindDir(name string) string {
+	for _, d := range c.Kinds {
+		if _, err := os.Stat(filepath.Join(d, name, "kind.toml")); err == nil {
+			return filepath.Join(d, name)
+		}
+	}
+	return ""
 }
 
 func (c *Config) LoadKind(name string) (*Kind, error) {
 	k := &Kind{}
-	p := filepath.Join(c.Kinds, name, "kind.toml")
-	if _, err := toml.DecodeFile(p, k); err != nil {
+	dir := c.KindDir(name)
+	if dir == "" {
+		return nil, fmt.Errorf("kind %s: not in %s", name, strings.Join(c.Kinds, ", "))
+	}
+	if _, err := toml.DecodeFile(filepath.Join(dir, "kind.toml"), k); err != nil {
 		return nil, fmt.Errorf("kind %s: %w", name, err)
 	}
 	if len(k.Steps) == 0 {
@@ -151,5 +201,5 @@ func (k *Kind) Spec(name string, args []string) proto.Spec {
 	return proto.Spec{Kind: name, Title: strings.TrimSpace(title), Args: args, Env: k.Env, Steps: k.Steps,
 		OnInterrupt: k.OnInterrupt, Needs: k.Needs, StopGrace: k.StopGrace, StallAfter: k.StallAfter,
 		ProgressRegex: k.ProgressRegex, ProgressPoll: k.ProgressPoll, PollEvery: k.PollEvery, Fits: k.Fits,
-		Review: k.Review, MaxRetries: k.MaxRetries}
+		Review: k.Review, Quiet: k.Quiet, Actions: k.Actions, MaxRetries: k.MaxRetries}
 }

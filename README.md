@@ -19,14 +19,37 @@ a manifest plus scripts in whatever language the work wants; the harness itself 
 gaffer submit KIND [flags] [--] ARGS...   # queue a job of a kind (kinds/<KIND>/kind.toml)
 gaffer run [flags] -- CMD...              # an ad-hoc command, same treatment
 gaffer ls / watch                         # the board: questions first, then review, failures, stalls, running, queued
-gaffer show ID / log ID [-f]              # detail + event history / console log (kept on the controller)
+gaffer show ID / log ID [-f]              # detail + event history / console log (kept on the controller; -f ends when it settles)
+gaffer wait [--events] [--any] ID...      # block until they settle or one needs you (see Waiting)
 gaffer pause|resume|cancel|retry [--resume]|release|ack|top ID...
+                                          # ack: a needs-you is answered, a failure seen (off FAILED, kept)
 gaffer drain|undrain HOST
 gaffer track TITLE / emit ID LINE         # work gaffer doesn't run, reporting in
+gaffer do ACTION ID / gaffer ACTION ID    # an action the item's kind or observer offers: gaffer ship 13
+gaffer kinds [--dirs]                     # the kinds this config sees, first dir wins
 ```
 
-Submit flags: `--host H` (pin), `--needs LABEL` (slot type, default `cpu`), `--prio N` (lower first),
-`--held REASON`, `--on-interrupt resume|restart|hold`, `--stall SEC`, `--review`, `-e K=V`, `--title`.
+Work runs on the box you start it on: gaffer is a board, not a dispatcher. To run something on another
+machine, ssh there and `gaffer run` / `gaffer submit` there; that box's agent runs it and the board shows it.
+`run` also carries your `PATH`, `VIRTUAL_ENV` and `CONDA_PREFIX`, so `gaffer run -- python x.py` behaves like
+typing `python x.py`. Run flags: `--progress tqdm|rsync|ffmpeg|pct` (presets; rsync wants
+`--info=progress2`) or `--progress-regex RX`.
+
+Submit flags: `--host H` (another box's agent instead of this one's), `--needs LABEL` (slot type, default `cpu`), `--prio N` (lower first),
+`--held REASON`, `--on-interrupt resume|restart|hold`, `--stall SEC`, `--review`, `--quiet` (board only,
+no ntfy pushes), `-e K=V`, `--title`.
+
+## Waiting
+
+`gaffer wait ID...` is for scripts and agents that start work and want to hear back without polling. It
+returns when every item has settled (done, failed, canceled, needs-you), or as soon as one is in trouble
+(failed, a question, review, held, stalled), or with `--any` when the first one settles. It prints a line
+per item and the log tail of the ones that need a look, and exits with the worst outcome: `0` done,
+`1` failed, `2` needs you, `3` canceled, `4` unknown id, `124` `--timeout DUR` ran out.
+
+`--events` streams a line per meaningful change (state, step, a question, a stall, progress in 10% steps)
+for something reading lines as they come, and keeps going through trouble until everything settles. Each
+round re-reads every item, so a controller restart only delays the answer.
 
 ## Progress
 
@@ -51,6 +74,54 @@ derives rate and ETA from the samples (slope over the last 10 min) unless the jo
 
 Only a *change* moves the progress clock, so a job (or a poll) repeating a stuck value goes **stalled**
 after `stall_after` seconds (default 15 min): alive but not moving, which a pid check never sees.
+
+## Observers: work gaffer doesn't run
+
+Renders in another queue, agent sessions, a ComfyUI queue: an **observer** is a script an agent runs every
+`every` seconds that prints the *whole current truth* of one source, and the controller reconciles, the
+way it does with agent reports. `::item KEY attrs...` starts an item; the protocol lines after it apply
+to that item:
+
+```
+::item 42 title="scene 3" host=boxb state=running stall=1800
+::progress done=88 total=92 unit=chunks eta=276
+::item 43 title="scene 4" state=queued reason="waiting for the GPU"
+::item 41 title="scene 2" state=needs-you
+::needs-you review: watch it, then ship it
+```
+
+- Attributes: `title`, `state` (`running queued paused held needs-you done failed canceled`, default
+  running), `host` (default: the agent running the observer), `kind` (default: the observer's name),
+  `reason`, `stall=SECONDS` (default never: most sources have nothing to say about stalls), `quiet=1`,
+  `started=` / `finished=` (unix seconds, the source's own times instead of when gaffer first saw it),
+  `actions=ship,redo` (what's on offer for this item right now; see Actions).
+- **A key missing from a snapshot is gone** (done, "gone from NAME"). A failed run (nonzero exit,
+  timeout) changes nothing: the board shows the source as FAILING, and as SILENT after three periods
+  without a report, both with one alert.
+- The source owns the item, so `pause`, `resume` and `retry` are refused (do that in the source). `ack` and
+  `cancel` (= dismiss) work and stick for as long as the source keeps reporting the same thing; an item
+  that starts running again comes back.
+- Observers go in the agent's config (they are per machine), the scripts anywhere:
+  `observers/comfyui` here is an example.
+
+`quiet` (an item attribute, a kind field, `--quiet`) keeps an item on the board without ntfy pushes, for
+sources that already notify on their own.
+
+## Actions
+
+`gaffer ship 13` (= `gaffer do ship 13`) runs an action on an item. The command comes from whoever owns
+the item: `actions = { ship = "$W_KIND_DIR/ship" }` in a kind.toml (offered once the job isn't running),
+or `actions = { ship = "..." }` on an `[[agent.observe]]` entry (offered when the snapshot says
+`actions=ship` on that item). An action is a **job of its own**: detached, logged, on the board, alerting
+on failure, run on the host that owns the item, with `W_ITEM`, `W_KEY`, `W_SOURCE`, `W_ITEM_HOST` (and
+`W_KIND_DIR` of the item's kind). Two rules make it safe for things like shipping:
+
+- One unfinished action per item; a second is refused.
+- An interrupted action is **held**, never retried. Whether it took effect is the owner's business: the
+  next snapshot (or a look) says. An action's exit code should mean what it says: wrap tools that print
+  an error and exit 0.
+- A failed action is filed away by itself (`acked`, an event says why) once the source reports its item
+  `done`: the thing it was for happened. A human `ack` on the item doesn't count.
 
 ## Surviving things
 
@@ -116,12 +187,20 @@ listen = "auto:8097"                   # controller bind: auto = tailscale IP, e
 data = "~/.local/share/gaffer"         # db + central logs (default)
 token_file = "~/.config/gaffer/token"  # created by the controller on first start; copy to agents
 ntfy = "http://ntfy.example:8093/gaffer"
-kinds = "~/src/gaffer/kinds"
+kinds = ["~/src/gaffer/kinds", "~/src/private-kinds"]   # or one dir; a kind's name resolves to the first dir that has it
 [agent]
 host = "boxa"
 dir = "~/.local/share/gaffer/agent"
 slots = { gpu = 1, cpu = 4 }
+path = ["/opt/tools/bin"]              # in front of PATH for every step, observer, action (a unit's PATH is bare)
+[[agent.observe]]                      # repeatable; see Observers
+name = "comfyui"
+run = "~/src/gaffer/observers/comfyui"
+every = 15
 ```
+
+Kinds that aren't public belong in a dir of their own (or next to the tool they drive), listed in `kinds`.
+`deploy.sh` pushes every dir to the remotes in the same order.
 
 ## Build and test
 
@@ -132,8 +211,11 @@ go test ./... && ./test/e2e.sh
 
 `test/e2e.sh` brings up a controller and two agents in a scratch dir and kills each piece in turn: agent
 `kill -9` mid-step (adopted, same attempt), job `kill -9` (resumed from checkpoint), simulated reboot
-(new boot id), pause/resume through a TERM checkpoint, failure + breaker, stall, a question mid-run,
-controller `kill -9` (job unaffected, full log arrives), restart policy, observed work, two hosts.
+(new boot id), pause/resume through a TERM checkpoint, failure + breaker + ack of a failure, stall, a question mid-run,
+controller `kill -9` (job unaffected, full log arrives), restart policy, observed work, a kind from a
+second kinds dir, observers (snapshot in, progress follows, ack sticks, a failing observer changes
+nothing, gone = done), actions (a job on the owner's host, refused when not on offer or already
+running, held when interrupted, a failure filed once the source says done, kind actions), two hosts.
 
 ## Deploy
 
@@ -145,6 +227,6 @@ a `* * * * * gaffer agent` cron line is a fine watchdog because an agent refuses
 
 ## Not yet
 
-Web board + ntfy action buttons, kind actions (`ship`, `redo`), server-side kind resolution on
-`POST /api/items` + a versioned API doc, several kind directories (public + private), history-based ETA
-priors before a job reports, job-dir GC on agents.
+Web board + ntfy action buttons (actions exist; the buttons would call `POST /api/items/ID/do`), server-side kind resolution on
+`POST /api/items` + a versioned API doc, history-based ETA priors before a job reports, job-dir GC on
+agents, observers on remote agents via `deploy.sh`, forgetting a source that was removed from the config.

@@ -28,6 +28,8 @@ type Spec struct {
 	PollEvery     int               `json:"poll_every,omitempty"`
 	Fits          string            `json:"fits,omitempty"` // run on the agent before starting; nonzero = not now
 	Review        bool              `json:"review,omitempty"`
+	Quiet         bool              `json:"quiet,omitempty"`       // board only, no pushes
+	Actions       map[string]string `json:"actions,omitempty"`     // name -> command, run as a job of its own
 	MaxRetries    int               `json:"max_retries,omitempty"` // interrupts tolerated before failing
 }
 
@@ -108,6 +110,8 @@ type SyncReq struct {
 	Slots   map[string]int `json:"slots"`
 	Jobs    []JobReport    `json:"jobs"`
 	Logs    []LogChunk     `json:"logs,omitempty"`
+	// the observers this agent runs; one it no longer runs is retired. nil (an older agent): no pruning.
+	Observers []string `json:"observers"`
 }
 
 type SyncResp struct {
@@ -137,18 +141,23 @@ type Item struct {
 	Reason     string      `json:"reason,omitempty"`
 	Attention  string      `json:"attention,omitempty"`
 	Observed   bool        `json:"observed,omitempty"`
+	Source     string      `json:"source,omitempty"` // the observer that reports it (observed items only)
+	Key        string      `json:"key,omitempty"`    // its id in that source
+	Parent     int64       `json:"parent,omitempty"` // an action job: the item it acts on
 	Progress   *Progress   `json:"progress,omitempty"`
 	Checkpoint *Checkpoint `json:"checkpoint,omitempty"`
 	Created    int64       `json:"created"`
 	Started    int64       `json:"started,omitempty"`
 	Finished   int64       `json:"finished,omitempty"`
+	Acked      int64       `json:"acked,omitempty"` // failed, and a human has seen it: off the FAILED list
 	Updated    int64       `json:"updated"`
 	Spec       Spec        `json:"spec"`
 	// derived at read time
-	Rate    float64 `json:"rate,omitempty"`     // units per second
-	ETA     float64 `json:"eta,omitempty"`      // seconds left
-	Stalled bool    `json:"stalled,omitempty"`  // running, but no progress for stall_after
-	LogSize int64   `json:"log_size,omitempty"` // bytes the controller holds
+	Actions []string `json:"actions,omitempty"`  // what `gaffer do NAME ID` offers right now
+	Rate    float64  `json:"rate,omitempty"`     // units per second
+	ETA     float64  `json:"eta,omitempty"`      // seconds left
+	Stalled bool     `json:"stalled,omitempty"`  // running, but no progress for stall_after
+	LogSize int64    `json:"log_size,omitempty"` // bytes the controller holds
 }
 
 // Controller-side item states.
@@ -178,8 +187,30 @@ type Host struct {
 	Failures int            `json:"failures"`
 }
 
+// ObserveReq is one run of an observer: on success Out is the full snapshot of its source.
+type ObserveReq struct {
+	Host    string            `json:"host"`
+	Every   int               `json:"every"`
+	Actions map[string]string `json:"actions,omitempty"` // the observer's commands, by action name
+	OK      bool              `json:"ok"`
+	Out     string            `json:"out,omitempty"`
+	Error   string            `json:"error,omitempty"`
+}
+
+type Source struct {
+	Name   string `json:"name"`
+	Host   string `json:"host"`
+	Every  int    `json:"every"`
+	Seen   int64  `json:"seen"` // last report, ok or not
+	OK     bool   `json:"ok"`
+	Error  string `json:"error,omitempty"`
+	Items  int    `json:"items"`  // active items it reports
+	Silent bool   `json:"silent"` // derived: no report for 3 periods
+}
+
 type Status struct {
-	Hosts []Host `json:"hosts"`
-	Items []Item `json:"items"`
-	Now   int64  `json:"now"`
+	Hosts   []Host   `json:"hosts"`
+	Sources []Source `json:"sources"`
+	Items   []Item   `json:"items"`
+	Now     int64    `json:"now"`
 }
