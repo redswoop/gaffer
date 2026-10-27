@@ -201,6 +201,9 @@ func (c *Controller) apply(it *rec, verb, body string) (string, error) {
 	}
 	switch verb {
 	case "pause":
+		if it.Parent != 0 {
+			return "", fmt.Errorf("#%d is an action; it runs to the end (cancel stops it)", it.ID)
+		}
 		switch it.State {
 		case proto.SQueued, proto.SHeld:
 			it.State = proto.SPaused

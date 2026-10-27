@@ -145,6 +145,8 @@ The design point is `kill -9` at any instant, because a shutdown gives a few sec
   After `max_retries` interrupts (default 3) it fails instead of looping.
 - **Pause is a stop at a checkpoint, not a kill.** TERM to the job's process group, `stop_grace` seconds
   to print a `::checkpoint` and exit, then KILL. The slot is free; `resume` continues from there.
+  Any exit code works; exit 0 after TERM means "yes, paused", never "step done". Actions can't be
+  paused (they run to the end; `cancel` stops one).
 - **Circuit breaker.** Two failures in a row on a host drains it (`undrain` after fixing).
 - **Alerts** (ntfy, if configured): failed, needs-you, ready for review, interrupted, stalled, host
   unreachable for 5 min, host rebooted, breaker.

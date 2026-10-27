@@ -3,7 +3,7 @@
 N=${1:-30}; S=${FAKE_SLEEP:-0.5}; MODE=${FAKE_MODE:-push}
 i=0
 if [ "$W_RESUME" = 1 ] && [ -n "$W_CKPT_UNIT" ]; then i=$W_CKPT_UNIT; echo "resuming at unit $i (checkpoint)"; fi
-trap 'echo "TERM at unit $i: checkpointing"; echo "::checkpoint unit=$i"; exit 143' TERM
+trap 'echo "TERM at unit $i: checkpointing"; echo "::checkpoint unit=$i"; exit ${FAKE_TERM_RC:-143}' TERM
 echo "::phase work"
 while [ "$i" -lt "$N" ]; do
   i=$((i+1))

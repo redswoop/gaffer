@@ -164,6 +164,11 @@ func readRC(j *job) (int, bool) {
 func (a *Agent) stepFinished(j *job, rc int, t int64) {
 	j.tail(t)
 	name := j.Spec.Steps[j.Step].Name
+	// exit 0 after TERM means "yes, stopped": the step resumes from its last checkpoint, not past it
+	if rc == 0 && j.TermSent {
+		a.end(j, proto.JStopped, fmt.Sprintf("stopped (%s) in %s, exit 0", j.StopMode, name), t)
+		return
+	}
 	if rc != 0 {
 		j.RC = rc
 		if j.StopMode != "" {

@@ -120,6 +120,15 @@ j=$(submit fake --host alpha -e FAKE_SLEEP=0.3 -- 40)
 done_ge "$j" 3 30; g pause "$j" >/dev/null; state "$j" paused 20 >/dev/null; g cancel "$j" >/dev/null
 check "cancel from paused says canceled" eq "$(f "$j" .reason)" canceled
 
+echo "-- exit 0 after TERM = paused, resumes inside the step"
+j=$(submit fake --host alpha -e FAKE_SLEEP=0.3 -e FAKE_TERM_RC=0 -- 40)
+done_ge "$j" 8 30; g pause "$j" >/dev/null
+check "exit 0 on TERM pauses"            state "$j" paused 20
+check "  in the step it stopped in"      eq "$(f "$j" .step)" 1
+g resume "$j" >/dev/null
+check "  resumed job finishes"           state "$j" needs-you 60
+check "  from the TERM checkpoint"       haslog "$j" "resuming at unit"
+
 echo "-- failure, then the circuit breaker drains the host"
 x=$(submit fake --host alpha -e FAKE_SLEEP=0.1 -e FAKE_FAIL=3 -- 10)
 check "failed"                        state "$x" failed 30
@@ -216,6 +225,7 @@ check "the item notes the outcome"    eval 'g show "$p1" | grep -q "ship #$a1 do
 check "not on offer: refused"         eval '! g ship "$p3" 2>/dev/null'
 a2=$(g ship "$p2" | actid)
 check "a second ship is refused"      eval '! g ship "$p2" 2>/dev/null'
+check "an action can't be paused"     eval '! g pause "$a2" 2>/dev/null'
 wait_for "$a2" '(.state=="running")' 20 >/dev/null; sleep 1; kill -9 -"$(jobpg "$a2")"
 check "interrupted action holds"      state "$a2" held 30
 g cancel "$a2" >/dev/null
