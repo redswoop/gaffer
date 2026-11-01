@@ -14,6 +14,7 @@ func testAgent(t *testing.T) *Agent {
 	dir := t.TempDir()
 	cfg := &config.Config{}
 	cfg.Agent.Host, cfg.Agent.Dir = "alpha", dir
+	cfg.Agent.Slots = map[string]int{"cpu": 2, "gpu": 1}
 	a := &Agent{cfg: cfg, host: "alpha", dir: dir, jobs: map[int64]*job{}, leases: map[string]*lease{}, res: map[string]*probed{}}
 	return a
 }
@@ -43,6 +44,9 @@ func TestLeaseGrantRefreshRefuse(t *testing.T) {
 	}
 	if r = a.acquire(proto.LeaseReq{Res: "gpu", Holder: "bad name!", TTLMS: 1}, 1); r.State != "refused" {
 		t.Fatalf("bad holder: %+v", r)
+	}
+	if r = a.acquire(proto.LeaseReq{Res: "status", Holder: "x", TTLMS: 1}, 1); r.State != "refused" {
+		t.Fatalf("unknown resource: %+v", r)
 	}
 	if r = a.acquire(proto.LeaseReq{Res: "gpu", Holder: "p"}, 1); r.State != "refused" {
 		t.Fatalf("no ttl, no process: %+v", r)

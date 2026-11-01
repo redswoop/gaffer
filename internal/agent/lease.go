@@ -121,6 +121,15 @@ func (a *Agent) leasesOn(res string) []*lease {
 	return out
 }
 
+func slotNames(m map[string]int) string {
+	names := make([]string, 0, len(m))
+	for n := range m {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
 func scopeActive(scope string) bool {
 	out, _ := exec.Command("systemctl", "--user", "is-active", scope).Output()
 	return strings.TrimSpace(string(out)) == "active"
@@ -190,6 +199,9 @@ func (a *Agent) blockingLease(res string, spec proto.Spec, step int, job int64) 
 func (a *Agent) acquire(req proto.LeaseReq, t int64) proto.LeaseResp {
 	if req.Res == "" || !holderRx.MatchString(req.Holder) {
 		return proto.LeaseResp{State: "refused", Reason: "need a resource and a holder name ([A-Za-z0-9_.-], up to 40)"}
+	}
+	if _, ok := a.cfg.Agent.Slots[req.Res]; !ok { // `gaffer lease status` must not mint a resource
+		return proto.LeaseResp{State: "refused", Reason: req.Res + " is not a resource here (slots: " + slotNames(a.cfg.Agent.Slots) + ")"}
 	}
 	if req.Class == "" {
 		req.Class = req.Holder
