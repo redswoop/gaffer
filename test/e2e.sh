@@ -48,7 +48,7 @@ printf '#!/bin/bash\necho "shipping $W_KEY for #$W_ITEM"\n[ "$W_KEY" = s2 ] && s
 chmod +x "$T/kinds/hello/say" "$T/observe" "$T/ship"
 export GAFFER_CONFIG=$T/alpha.toml
 
-start_controller() { setsid "$BIN" controller >> "$T/controller.log" 2>&1 & echo $! > "$T/controller.pid"
+start_controller() { GAFFER_REJECT_BACKOFF=3 setsid "$BIN" controller >> "$T/controller.log" 2>&1 & echo $! > "$T/controller.pid"
   for _ in $(seq 50); do [ -s "$T/token" ] && "$BIN" ls >/dev/null 2>&1 && return; sleep 0.1; done; echo "controller didn't come up"; exit 1; }
 start_agent() { GAFFER_CONFIG=$T/$1.toml GAFFER_BOOT_ID=$BOOT setsid "$BIN" agent >> "$T/$1.log" 2>&1 & echo $! > "$T/$1.pid"; }
 kill9() { kill -9 "$(cat "$T/$1.pid")" 2>/dev/null; sleep 0.3; }
@@ -121,6 +121,23 @@ done_ge "$j" 7 30; kill -HUP -"$(jobpg "$j")"
 check "HUP from outside = interrupted"  eval 'wait_for "$j" "(.attempt==2)" 30 && g show "$j" | grep -q "killed by SIGHUP from outside gaffer"'
 check "  not a failure: host not held" eq "$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.held')" false
 check "  job finishes on attempt 2"    state "$j" needs-you 60
+
+echo "-- fits: a rejection is not an attempt, retries go in queue order"
+touch "$T/nofit"
+fa=$(submit fake --host alpha -e FAKE_NOFIT=$T/nofit -e FAKE_SLEEP=0.3 -- 30); sleep 1.5
+fb=$(submit fake --host alpha -e FAKE_NOFIT=$T/nofit -e FAKE_SLEEP=0.3 -- 30); sleep 1.5
+fc=$(submit fake --host alpha -e FAKE_NOFIT=$T/nofit -e FAKE_SLEEP=0.3 -- 30)
+check "rejected items wait, visibly"   wait_for "$fc" '(.state=="queued" and ((.reason // "")|test("waiting: alpha: blocked by nofit")))' 20
+sleep 9   # several retry beats (GAFFER_REJECT_BACKOFF=3 below) with nothing fitting
+check "  retries don't count as attempts" eq "$(f "$fa" .attempt)/$(f "$fb" .attempt)/$(f "$fc" .attempt)" 0/0/0
+check "  one event, not one per retry"    eq "$(g show "$fa" | grep -c '  waiting  ')" 1
+check "  log untouched by the retries"    eval '[ "$(g log -n 100000 "$fa" | grep -c "gaffer: #")" = 0 ]'
+rm "$T/nofit"
+check "fits again: the queue head runs"  eval 'state "$fa" running 20 && state "$fb" running 20'
+check "  not the youngest"               eq "$(f "$fc" .state)" queued
+check "  attempt 1 once it really runs"  eq "$(f "$fa" .attempt)" 1
+check "  the three finish"               eval 'state "$fa" needs-you 60 && state "$fb" needs-you 60 && state "$fc" needs-you 60'
+g ack "$fa" "$fb" "$fc" >/dev/null
 
 echo "-- hold / release / drain / shutdown"
 g hold alpha >/dev/null

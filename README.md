@@ -178,7 +178,7 @@ needs = "gpu"                     # slot label; agents advertise slots = { gpu =
 stop_grace = 30
 stall_after = 600
 review = true                     # finish in needs-you; `gaffer ack` = done
-fits = '$W_KIND_DIR/fits'         # nonzero exit = not now (VRAM, a lease); output = the reason; retried in 30 s
+fits = '$W_KIND_DIR/fits'         # nonzero exit = not now (VRAM, a lease); output = the reason; retried every 30 s, queue order
 progress_regex = '...'
 progress_poll = '$W_KIND_DIR/poll "$@"'
 poll_every = 15
@@ -229,8 +229,8 @@ go test ./... && ./test/e2e.sh
 `test/e2e.sh` brings up a controller and two agents in a scratch dir and kills each piece in turn: agent
 `kill -9` mid-step (adopted, same attempt), job `kill -9` (resumed from checkpoint), simulated reboot
 (new boot id), a step's unwatched exit 0 before a reboot, pause/resume through a TERM checkpoint, failure + breaker +
-ack of a failure, stall, a question mid-run, a step killed by a stray HUP, hold/release/drain of a host, the shutdown
-hook with the controller unreachable,
+ack of a failure, stall, a question mid-run, a step killed by a stray HUP, a fits check saying not now (no attempt, no
+event spam, queue order when it fits again), hold/release/drain of a host, the shutdown hook with the controller unreachable,
 controller `kill -9` (job unaffected, full log arrives), restart policy, observed work, a kind from a
 second kinds dir, observers (snapshot in, progress follows, ack sticks, a failing observer changes
 nothing, gone = done), actions (a job on the owner's host, refused when not on offer or already

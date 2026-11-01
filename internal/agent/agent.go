@@ -274,8 +274,8 @@ func (a *Agent) spawn(j *job, t int64) {
 func (a *Agent) start(as proto.Assign) {
 	t := now()
 	j := a.jobs[as.ID]
-	if j != nil && (j.Attempt >= as.Attempt || j.State == proto.JRunning) {
-		return
+	if j != nil && (j.State == proto.JRunning || (j.Attempt >= as.Attempt && !(j.State == proto.JRejected && j.Acked))) {
+		return // already on it, or a stale re-send (a fits rejection the controller has taken back doesn't count as an attempt)
 	}
 	dir := filepath.Join(a.dir, "jobs", strconv.FormatInt(as.ID, 10))
 	if j == nil {
@@ -306,14 +306,14 @@ func (a *Agent) start(as proto.Assign) {
 	} else if as.Step > 0 {
 		how = "from step " + j.Spec.Steps[as.Step].Name
 	}
-	j.logf("──── gaffer: #%d attempt %d on %s, %s, %s ────", j.ID, j.Attempt, a.host, how, time.Now().Format("Mon 15:04:05"))
-	if j.Spec.Fits != "" {
+	if j.Spec.Fits != "" { // before the banner: a "not now" leaves no trace in the job's log
 		if out, ok := a.runAux(j, j.Spec.Fits, 60*time.Second); !ok {
 			lines := strings.Split(strings.TrimSpace(out), "\n")
 			a.end(j, proto.JRejected, trunc(lines[len(lines)-1], 200), t)
 			return
 		}
 	}
+	j.logf("──── gaffer: #%d attempt %d on %s, %s, %s ────", j.ID, j.Attempt, a.host, how, time.Now().Format("Mon 15:04:05"))
 	a.spawn(j, t)
 }
 

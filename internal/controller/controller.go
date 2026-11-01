@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,9 +26,19 @@ const (
 	offlineAlertAfter = 5 * 60 * 1000
 	defaultStall      = 15 * 60
 	defaultRetries    = 3
-	rejectBackoff     = 30 * 1000
 	breakerFailures   = 2
 )
+
+// rejectBackoff is how long a fits rejection keeps an item off that host, ms. Every rejected item on a
+// host retries on the same beat (expiry aligned to this grid), head of the queue first. Tests shrink it.
+var rejectBackoff = func() int64 {
+	if s := os.Getenv("GAFFER_REJECT_BACKOFF"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			return int64(n) * 1000
+		}
+	}
+	return 30 * 1000
+}()
 
 func nowMS() int64            { return time.Now().UnixMilli() }
 func logf(f string, a ...any) { log.Printf(f, a...) }
@@ -185,7 +196,7 @@ func (c *Controller) running(it *rec, r proto.JobReport, host string) {
 		return
 	}
 	if it.State == proto.SAssigned {
-		it.State = proto.SRunning
+		it.State, it.Reason, it.RejectHost, it.RejectUntil = proto.SRunning, "", "", 0
 		if it.StopMode != "" {
 			it.State = proto.SStopping
 		}
@@ -268,7 +279,15 @@ func (c *Controller) finished(it *rec, r proto.JobReport, host string) {
 		c.interrupted(it, host, r.Reason, r.Checkpoint, r.Step)
 		return
 	case proto.JRejected:
-		it.State, it.Reason, it.RejectHost, it.RejectUntil = proto.SQueued, "waiting: "+host+": "+r.Reason, host, nowMS()+rejectBackoff
+		// Not now, says the kind's fits check: nothing started, so this wasn't an attempt. Every rejected
+		// item on the host retries on the same beat (expiry aligned to the backoff grid), so when the
+		// resource frees the head of the queue gets it, not whichever item's backoff happened to expire first.
+		reason := "waiting: " + host + ": " + r.Reason
+		if reason != it.Reason {
+			c.event(it.ID, "waiting", host+": "+r.Reason)
+		}
+		it.Attempt--
+		it.State, it.Reason, it.RejectHost, it.RejectUntil = proto.SQueued, reason, host, (nowMS()/rejectBackoff+1)*rejectBackoff
 		if it.StopMode != "" {
 			it.State, it.Reason, it.StopMode = map[string]string{"cancel": proto.SCanceled, "pause": proto.SPaused}[it.StopMode], "", ""
 		}
@@ -368,9 +387,15 @@ func (c *Controller) schedule(req proto.SyncReq) []proto.Assign {
 			continue
 		}
 		it.Attempt++
-		it.State, it.Host, it.Reason = proto.SAssigned, req.Host, ""
+		retry := it.RejectHost == req.Host // another go after a fits rejection: already on the record
+		it.State, it.Host = proto.SAssigned, req.Host
+		if !retry {
+			it.Reason = ""
+		}
 		c.put(it)
-		c.event(it.ID, "assigned", fmt.Sprintf("attempt %d to %s", it.Attempt, req.Host))
+		if !retry {
+			c.event(it.ID, "assigned", fmt.Sprintf("attempt %d to %s", it.Attempt, req.Host))
+		}
 		out = append(out, c.assignment(it))
 		used[n]++
 	}
