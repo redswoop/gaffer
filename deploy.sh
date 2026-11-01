@@ -34,13 +34,15 @@ slots = $SLOTS
 EOT
 \cp -f deploy/gaffer-*.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable gaffer-controller.service gaffer-agent.service >/dev/null 2>&1
+systemctl --user enable gaffer-controller.service gaffer-agent.service gaffer-shutdown.service >/dev/null 2>&1
 systemctl --user restart gaffer-controller.service
 for _ in $(seq 50); do [ -s ~/.config/gaffer/token ] && break; sleep 0.1; done
 systemctl --user restart gaffer-agent.service
+systemctl --user start gaffer-shutdown.service   # its ExecStop runs at shutdown: pauses this host's jobs first
 
-# Remotes need no root and no linger: the agent dials out over HTTP. A cron line keeps it up across
-# reboots, since the agent refuses to run twice: `* * * * * $REMOTE_DATA/bin/gaffer agent >>$REMOTE_DATA/agent.log 2>&1`
+# Remotes need no root: the agent dials out over HTTP. They do need lingering (the user units must outlive
+# ssh sessions, and the shutdown hook must run at shutdown, not at logout); `loginctl enable-linger` on
+# yourself works on a stock systemd. An old cron keeper line for the agent is removed if found.
 mapfile -t KDIRS < <(./gaffer kinds --dirs)
 for R in $REMOTES; do
   D=$REMOTE_DATA
@@ -62,6 +64,11 @@ dir = "$D/agent"
 slots = $REMOTE_SLOTS
 EOT
   ssh "$R" "umask 077; cat > ~/.config/gaffer/token" < ~/.config/gaffer/token
-  ssh "$R" "pid=\$(cat $D/agent.pid 2>/dev/null) && kill \$pid 2>/dev/null; sleep 1; cd $D && setsid nohup $D/bin/gaffer agent >> $D/agent.log 2>&1 < /dev/null & echo \$! > $D/agent.pid"
+  rsync -a deploy/gaffer-agent.service deploy/gaffer-shutdown.service "$R:.config/systemd/user/"
+  ssh "$R" "export XDG_RUNTIME_DIR=/run/user/\$(id -u); loginctl enable-linger 2>/dev/null || echo 'warning: enable-linger failed on $R; run it as root'
+    crontab -l 2>/dev/null | grep -v 'gaffer agent' | crontab - 2>/dev/null
+    pid=\$(fuser $D/agent/agent.lock 2>/dev/null || cat $D/agent.pid 2>/dev/null); [ -n \"\$pid\" ] && kill \$pid 2>/dev/null; rm -f $D/agent.pid   # a pre-unit agent (nohup/cron): the lock holder, exactly
+    systemctl --user daemon-reload && systemctl --user enable gaffer-agent.service gaffer-shutdown.service >/dev/null 2>&1
+    systemctl --user restart gaffer-agent.service && systemctl --user start gaffer-shutdown.service"
 done
 echo "deployed $(git rev-parse --short HEAD 2>/dev/null || echo uncommitted): controller http://$IP:8097, agents $HOST $REMOTES"

@@ -1,0 +1,17 @@
+[Unit]
+Description=gaffer: pause this host's jobs before the system goes down
+# Stopped before the agent is (reverse of After=). Needs no network: it talks to the agent through its dir.
+After=gaffer-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+# Ask the agent to pause every running job and wait for it. The pauses are reported to the controller
+# when it is next reachable (after the reboot); the jobs come back paused, for `gaffer resume`.
+ExecStop=%h/.local/bin/gaffer shutdown --wait 60
+TimeoutStopSec=90
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

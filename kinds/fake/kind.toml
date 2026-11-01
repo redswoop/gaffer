@@ -8,6 +8,7 @@ review = true
 progress_regex = 'frame (?P<done>\d+) of (?P<total>\d+)'
 progress_poll = '$W_KIND_DIR/poll "$@"'
 poll_every = 5
+actions = { ship = '$W_KIND_DIR/ship' }
 
 [[steps]]
 name = "prep"

@@ -182,8 +182,8 @@ func header(w io.Writer, st proto.Status, s style) {
 		switch {
 		case !h.Online:
 			bad = append(bad, s.red(fmt.Sprintf("%s OFFLINE %s", h.Host, fmtDur(float64(st.Now-h.Seen)/1000))))
-		case h.Drained:
-			bad = append(bad, s.yellow(h.Host+" DRAINED: "+h.Note)+" "+s.dim("(gaffer undrain "+h.Host+")"))
+		case h.Held:
+			bad = append(bad, s.yellow(h.Host+" HELD: "+h.Note)+" "+s.dim("(gaffer release "+h.Host+")"))
 		default:
 			ok = append(ok, desc)
 		}

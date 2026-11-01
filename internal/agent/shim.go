@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // Shim is `gaffer _shim JOBDIR ATTEMPT STEP`. The agent starts it with setsid, so it leads its own
@@ -37,20 +39,20 @@ func Shim(dir string, attempt, step int) error {
 	}
 	cmd.Env = j.env(dir, step)
 	cmd.Stdout, cmd.Stderr = log, log
-	rc := 0
+	rc, sig := 0, ""
 	if err := cmd.Run(); err != nil {
 		rc = 127
 		if ee, ok := err.(*exec.ExitError); ok {
 			rc = ee.ExitCode()
 			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-				rc = 128 + int(ws.Signal())
+				rc, sig = 128+int(ws.Signal()), unix.SignalName(ws.Signal()) // died by a signal, as opposed to exiting 143 by choice
 			}
 		} else {
 			fmt.Fprintf(log, "gaffer: step %s did not start: %v\n", st.Name, err)
 		}
 	}
 	tmp := rcPath(dir, attempt, step) + ".tmp"
-	os.WriteFile(tmp, []byte(strconv.Itoa(rc)+"\n"), 0o644)
+	os.WriteFile(tmp, []byte(strconv.Itoa(rc)+"\n"+sig+"\n"), 0o644) // line 2: the signal name, if it died by one
 	return os.Rename(tmp, rcPath(dir, attempt, step))
 }
 

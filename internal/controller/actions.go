@@ -72,11 +72,26 @@ func (c *Controller) offers(it *rec) []string {
 	return keys(it.Spec.Actions)
 }
 
-// childEvent notes an action's outcome on the item it acted on.
+// childEvent notes an action's outcome on the item it acted on. A kind item waiting in review is
+// filed (done, as if acked) when an action on it succeeds: the action was the answer to the review. An
+// observed item is left alone, its source's next snapshot says what the action did.
 func (c *Controller) childEvent(it *rec) {
-	if it.Parent != 0 && len(it.Spec.Steps) > 0 {
-		c.event(it.Parent, "action", strings.TrimSpace(fmt.Sprintf("%s #%d %s %s", it.Spec.Steps[0].Name, it.ID, it.State, it.Reason)))
+	if it.Parent == 0 || len(it.Spec.Steps) == 0 {
+		return
 	}
+	name := it.Spec.Steps[0].Name
+	c.event(it.Parent, "action", strings.TrimSpace(fmt.Sprintf("%s #%d %s %s", name, it.ID, it.State, it.Reason)))
+	p := c.get(it.Parent)
+	if it.State != proto.SDone || p == nil || p.Source != "" || p.State != proto.SNeedsYou {
+		return
+	}
+	p.State, p.AttentionAcked, p.Attention = proto.SDone, p.Attention, ""
+	p.Reason = fmt.Sprintf("%s #%d done", name, it.ID)
+	if p.Finished == 0 {
+		p.Finished = nowMS()
+	}
+	c.event(p.ID, "done", "review closed by "+p.Reason)
+	c.put(p)
 }
 
 func offered(list, name string) bool {

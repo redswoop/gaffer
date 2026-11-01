@@ -1,0 +1,3 @@
+#!/bin/bash
+# the test action: shipping a reviewed fake job is printing that it did
+echo "shipping #$W_ITEM from $W_KIND_DIR"

@@ -45,6 +45,7 @@ type Agent struct {
 	obsLast map[string]int64
 	obsBusy map[string]bool
 	obsDone chan string
+	lock    *os.File // agent.lock, held for the agent's whole life (see Run)
 }
 
 func now() int64 { return time.Now().UnixMilli() }
@@ -67,6 +68,7 @@ func Run(cfg *config.Config) error {
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return fmt.Errorf("another agent holds %s", lock.Name())
 	}
+	a.lock = lock // keep it referenced: a finalized *os.File closes the fd, and that drops the flock
 	dirs, _ := filepath.Glob(filepath.Join(a.dir, "jobs", "*"))
 	for _, d := range dirs {
 		if j, err := loadJob(d); err == nil {
@@ -74,9 +76,11 @@ func Run(cfg *config.Config) error {
 		}
 	}
 	log.Printf("agent %s up (boot %.8s), %d job dirs, controller %s", a.host, bootID(), len(a.jobs), cfg.Controller)
+	os.Remove(a.pauseAllPath()) // a request from before a restart or reboot is void: nothing of that is running
 	lastSync := int64(0)
 	for {
 		t := now()
+		a.pauseAll(t)
 		a.drainPolls(t)
 		a.observe(t)
 		for _, j := range a.jobs {
@@ -109,8 +113,15 @@ func (a *Agent) tick(j *job, t int64) {
 		return
 	}
 	j.tail(t)
-	if rc, ok := readRC(j); ok {
-		a.stepFinished(j, rc, t)
+	if rc, sig, ok := readRC(j); ok {
+		// Exit 0 nobody watched, from before a reboot, with no TERM of ours on record: the OS's shutdown TERM
+		// looks exactly like this, and the step answered it by stopping, not finishing. Don't trust it as
+		// done; interrupt, and the kind's policy reruns the step (a finished step is cheap to rerun).
+		if id, ok := readIdent(pidPath(j.dir, j.Attempt, j.Step)); ok && rc == 0 && !j.TermSent && j.StopMode == "" && id.Boot != bootID() {
+			a.end(j, proto.JInterrupted, "machine rebooted; the step exited 0 unwatched (shutdown's TERM?), not taking that as done", t)
+			return
+		}
+		a.stepFinished(j, rc, sig, t)
 		return
 	}
 	id, ok := readIdent(pidPath(j.dir, j.Attempt, j.Step))
@@ -136,8 +147,8 @@ func (a *Agent) tick(j *job, t int64) {
 		a.maybePoll(j, t)
 		return
 	}
-	if rc, ok := readRC(j); ok { // exited between the two checks
-		a.stepFinished(j, rc, t)
+	if rc, sig, ok := readRC(j); ok { // exited between the two checks
+		a.stepFinished(j, rc, sig, t)
 		return
 	}
 	j.tail(t)
@@ -152,16 +163,21 @@ func (a *Agent) tick(j *job, t int64) {
 	a.end(j, proto.JInterrupted, why, t)
 }
 
-func readRC(j *job) (int, bool) {
+// readRC: the shim's exit record, "RC\n[SIGNAME]\n". The signal line is set when the step died by a signal.
+func readRC(j *job) (rc int, sig string, ok bool) {
 	b, err := os.ReadFile(rcPath(j.dir, j.Attempt, j.Step))
 	if err != nil {
-		return 0, false
+		return 0, "", false
 	}
-	rc, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	return rc, err == nil
+	lines := strings.SplitN(string(b), "\n", 3)
+	rc, err = strconv.Atoi(strings.TrimSpace(lines[0]))
+	if len(lines) > 1 {
+		sig = strings.TrimSpace(lines[1])
+	}
+	return rc, sig, err == nil
 }
 
-func (a *Agent) stepFinished(j *job, rc int, t int64) {
+func (a *Agent) stepFinished(j *job, rc int, sig string, t int64) {
 	j.tail(t)
 	name := j.Spec.Steps[j.Step].Name
 	// exit 0 after TERM means "yes, stopped": the step resumes from its last checkpoint, not past it
@@ -173,6 +189,10 @@ func (a *Agent) stepFinished(j *job, rc int, t int64) {
 		j.RC = rc
 		if j.StopMode != "" {
 			a.end(j, proto.JStopped, fmt.Sprintf("stopped (%s) in %s, rc %d", j.StopMode, name, rc), t)
+		} else if sig == "SIGTERM" || sig == "SIGHUP" || sig == "SIGINT" {
+			// Killed by a stop signal we never sent: a session teardown, a shutdown without the hook, someone's
+			// kill. Not the step's fault, so not a failure: interrupted, and the kind's policy says what next.
+			a.end(j, proto.JInterrupted, fmt.Sprintf("%s killed by %s from outside gaffer (logout? shutdown?)", name, sig), t)
 		} else {
 			a.end(j, proto.JFailed, fmt.Sprintf("%s exited %d: %s", name, rc, j.lastError()), t)
 		}
@@ -192,6 +212,30 @@ func (a *Agent) stepFinished(j *job, rc int, t int64) {
 		return
 	}
 	a.spawn(j, t)
+}
+
+// pauseAll: `gaffer shutdown` (the OS shutdown hook) asks for every running job to pause by dropping a
+// file in the agent dir: no controller, no network, which are both going away at that moment. The
+// pauses are recorded on disk like any other and reported when the controller is next reachable, after
+// the reboot if need be. A request older than two minutes is stale (the hook died) and ignored.
+func (a *Agent) pauseAllPath() string { return filepath.Join(a.dir, "pause-all") }
+
+func (a *Agent) pauseAll(t int64) {
+	st, err := os.Stat(a.pauseAllPath())
+	if err != nil {
+		return
+	}
+	if t-st.ModTime().UnixMilli() > 120000 {
+		os.Remove(a.pauseAllPath())
+		return
+	}
+	for _, j := range a.jobs {
+		if j.State == proto.JRunning && j.StopMode == "" && j.Spec.OnInterrupt != "hold" { // actions (hold) run to the end or get held
+			j.StopMode, j.StopAt = "pause", t
+			j.save()
+			log.Printf("#%d: pause requested (shutdown)", j.ID)
+		}
+	}
 }
 
 func (a *Agent) end(j *job, state, reason string, t int64) {

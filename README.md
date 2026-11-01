@@ -23,7 +23,9 @@ gaffer show ID / log ID [-f]              # detail + event history / console log
 gaffer wait [--events] [--any] ID...      # block until they settle or one needs you (see Waiting)
 gaffer pause|resume|cancel|retry [--resume]|release|ack|top ID...
                                           # ack: a needs-you is answered, a failure seen (off FAILED, kept)
-gaffer drain|undrain HOST
+gaffer hold|release HOST                  # hold: no new work lands there (running jobs go on); release undoes it
+gaffer drain HOST                         # hold + pause everything running there
+gaffer shutdown                           # pause every job on this box and wait for it: the OS shutdown hook
 gaffer track TITLE / emit ID LINE         # work gaffer doesn't run, reporting in
 gaffer do ACTION ID / gaffer ACTION ID    # an action the item's kind or observer offers: gaffer ship 13
 gaffer kinds [--dirs]                     # the kinds this config sees, first dir wins
@@ -122,6 +124,8 @@ on failure, run on the host that owns the item, with `W_ITEM`, `W_KEY`, `W_SOURC
   an error and exit 0.
 - A failed action is filed away by itself (`acked`, an event says why) once the source reports its item
   `done`: the thing it was for happened. A human `ack` on the item doesn't count.
+- A kind item sitting in review is filed (`done`) when an action on it succeeds: the action was the answer
+  to the review. An observed item isn't; its source's next snapshot says what the action did.
 
 ## Surviving things
 
@@ -147,7 +151,15 @@ The design point is `kill -9` at any instant, because a shutdown gives a few sec
   to print a `::checkpoint` and exit, then KILL. The slot is free; `resume` continues from there.
   Any exit code works; exit 0 after TERM means "yes, paused", never "step done". Actions can't be
   paused (they run to the end; `cancel` stops one).
-- **Circuit breaker.** Two failures in a row on a host drains it (`undrain` after fixing).
+- **Shutdown.** `deploy/gaffer-shutdown.service` runs `gaffer shutdown` as the system goes down, before
+  the agent is stopped: it asks the agent (a file in its dir, no network, which is already going) to
+  pause every running job, and blocks until they have (up to `TimeoutStopSec`). The pauses are on disk
+  and reach the controller after the reboot; the jobs come back paused, at their checkpoints, for
+  `gaffer resume`. Two backstops for when the hook doesn't run (power cut, `reboot -f`, a job started
+  outside the agent's unit): a step killed by TERM/HUP/INT that gaffer didn't send is interrupted, not
+  failed; and an exit 0 from before the reboot with no TERM of gaffer's on record is interrupted, not
+  done (the OS's shutdown TERM makes a stopped step look finished).
+- **Circuit breaker.** Two failures in a row on a host holds it (`gaffer release` after fixing).
 - **Alerts** (ntfy, if configured): failed, needs-you, ready for review, interrupted, stalled, host
   unreachable for 5 min, host rebooted, breaker.
 
@@ -213,7 +225,9 @@ go test ./... && ./test/e2e.sh
 
 `test/e2e.sh` brings up a controller and two agents in a scratch dir and kills each piece in turn: agent
 `kill -9` mid-step (adopted, same attempt), job `kill -9` (resumed from checkpoint), simulated reboot
-(new boot id), pause/resume through a TERM checkpoint, failure + breaker + ack of a failure, stall, a question mid-run,
+(new boot id), a step's unwatched exit 0 before a reboot, pause/resume through a TERM checkpoint, failure + breaker +
+ack of a failure, stall, a question mid-run, a step killed by a stray HUP, hold/release/drain of a host, the shutdown
+hook with the controller unreachable,
 controller `kill -9` (job unaffected, full log arrives), restart policy, observed work, a kind from a
 second kinds dir, observers (snapshot in, progress follows, ack sticks, a failing observer changes
 nothing, gone = done), actions (a job on the owner's host, refused when not on offer or already
@@ -222,8 +236,8 @@ running, held when interrupted, a failure filed once the source says done, kind 
 ## Deploy
 
 `./deploy.sh` builds, installs the controller + agent as systemd user units on this host, and pushes
-the binary, kinds, config and token to each host in `REMOTES` (settings in an untracked `deploy.local`;
-see the top of the script). Remote agents need no root: they dial out to the controller over HTTP, and
+the binary, kinds, config, token and the agent + shutdown units to each host in `REMOTES` (settings in an
+untracked `deploy.local`; see the top of the script). Remote agents need no root: they dial out to the controller over HTTP, and
 a `* * * * * gaffer agent` cron line is a fine watchdog because an agent refuses to run twice.
 `demo/tour.sh` is a three-minute guided demo that runs as a gaffer job.
 

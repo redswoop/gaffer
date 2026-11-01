@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"gaffer/internal/config"
@@ -93,7 +94,15 @@ func Main(cfg *config.Config, cmd string, args []string) {
 		logCmd(c, args)
 	case "wait":
 		wait(c, args)
-	case "pause", "cancel", "resume", "release", "ack", "top", "retry":
+	case "shutdown":
+		shutdown(cfg, args)
+	case "release", "hold", "drain":
+		if cmd != "release" || (len(args) == 1 && !isID(args[0])) {
+			hostCmd(c, cmd, args)
+			return
+		}
+		fallthrough
+	case "pause", "cancel", "resume", "ack", "top", "retry":
 		fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 		resume := fs.Bool("resume", false, "retry: keep the step + checkpoint instead of starting over")
 		fs.Parse(args)
@@ -117,12 +126,6 @@ func Main(cfg *config.Config, cmd string, args []string) {
 		if failed {
 			os.Exit(1)
 		}
-	case "drain", "undrain":
-		if len(args) != 1 {
-			die(fmt.Errorf("%s HOST", cmd))
-		}
-		die(c.do("POST", "/api/hosts/"+args[0]+"/"+cmd, "", nil))
-		fmt.Printf("%s %sed\n", args[0], cmd)
 	case "track":
 		fs := flag.NewFlagSet("track", flag.ExitOnError)
 		kind := fs.String("kind", "observed", "")
@@ -207,7 +210,9 @@ func usage() {
   gaffer wait [--events] [--any] ID...       block until they settle, or one needs you; exit 0 done,
                                              1 failed, 2 needs you, 3 canceled, 124 --timeout
   gaffer pause|resume|cancel|retry [--resume]|release|ack|top ID...
-  gaffer drain|undrain HOST
+  gaffer hold|release HOST                   hold: no new work lands there (running jobs go on); release undoes it
+  gaffer drain HOST                          hold + pause everything running there (prints the ids)
+  gaffer shutdown [--wait SEC]               pause every job on this box and wait for it: the OS shutdown hook
   gaffer track TITLE...                      observe work gaffer doesn't run; prints an id
   gaffer emit [ID] LINE...                   ::progress / ::phase / ::checkpoint / ::needs-you / ::done / ::fail
                                              (inside a gaffer job: no ID, goes to the job's own log)
@@ -586,3 +591,100 @@ func clock(t time.Time) string {
 }
 
 func clockMS(ms int64) string { return clock(time.UnixMilli(ms)) }
+
+func isID(s string) bool {
+	_, err := strconv.Atoi(s)
+	return err == nil
+}
+
+// hostCmd: hold (no new work there), release, drain (hold + pause what runs there), through the controller.
+func hostCmd(c *client, cmd string, args []string) {
+	if len(args) != 1 {
+		die(fmt.Errorf("%s HOST", cmd))
+	}
+	host := args[0]
+	if cmd == "release" {
+		die(c.do("POST", "/api/hosts/"+host+"/release", "", nil))
+		fmt.Printf("%s released\n", host)
+		return
+	}
+	die(c.do("POST", "/api/hosts/"+host+"/hold", "", nil))
+	fmt.Printf("%s held\n", host)
+	if cmd == "hold" {
+		return
+	}
+	var st proto.Status
+	die(c.do("GET", "/api/status", nil, &st))
+	var paused []int64
+	for _, it := range st.Items {
+		if it.Host != host || it.Source != "" || it.Parent != 0 {
+			continue // actions run to the end; observed items aren't ours to stop
+		}
+		switch it.State {
+		case proto.SAssigned, proto.SRunning, proto.SStopping:
+			var r map[string]string
+			if err := c.do("POST", fmt.Sprintf("/api/items/%d/pause", it.ID), "", &r); err != nil {
+				fmt.Fprintf(os.Stderr, "gaffer: #%d: %v\n", it.ID, err)
+				continue
+			}
+			paused = append(paused, it.ID)
+			fmt.Printf("#%d -> %s\n", it.ID, r["ok"])
+		}
+	}
+}
+
+// shutdown is the OS shutdown hook, and works with the network already gone: it asks this box's agent
+// (a file in its dir) to pause every running job, then blocks until none is running, so systemd waits.
+// The agent records the pauses on disk and reports them when it next reaches the controller, after the
+// reboot if need be; the jobs come back paused, for `gaffer resume`. Nothing to do if no agent is up.
+func shutdown(cfg *config.Config, args []string) {
+	fs := flag.NewFlagSet("shutdown", flag.ExitOnError)
+	wait := fs.Int("wait", 60, "seconds to wait for the jobs to stop")
+	fs.Parse(args)
+	dir := cfg.Agent.Dir
+	if dir == "" {
+		die(fmt.Errorf("no [agent] dir in the config: this box runs no jobs"))
+	}
+	if f, err := os.OpenFile(filepath.Join(dir, "agent.lock"), os.O_RDWR, 0); err == nil {
+		if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil { // we got it: no agent holds it
+			fmt.Println("no agent running here; nothing to pause")
+			return
+		}
+	} else {
+		fmt.Println("no agent dir here; nothing to pause")
+		return
+	}
+	running := func() (n int, ids []string) {
+		dirs, _ := filepath.Glob(filepath.Join(dir, "jobs", "*", "job.json"))
+		for _, p := range dirs {
+			var j struct {
+				ID    int64  `json:"id"`
+				State string `json:"state"`
+			}
+			if b, err := os.ReadFile(p); err == nil && json.Unmarshal(b, &j) == nil && j.State == "running" {
+				n++
+				ids = append(ids, "#"+strconv.FormatInt(j.ID, 10))
+			}
+		}
+		return
+	}
+	n, ids := running()
+	if n == 0 {
+		fmt.Println("nothing running here; safe to go down")
+		return
+	}
+	die(os.WriteFile(filepath.Join(dir, "pause-all"), []byte(time.Now().Format(time.RFC3339)+"\n"), 0o644))
+	defer os.Remove(filepath.Join(dir, "pause-all"))
+	fmt.Printf("pausing %s\n", strings.Join(ids, " "))
+	deadline := time.Now().Add(time.Duration(*wait) * time.Second)
+	for {
+		time.Sleep(time.Second)
+		if left, ids := running(); left == 0 {
+			fmt.Printf("%d paused, safe to go down\n", n)
+			return
+		} else if time.Now().After(deadline) {
+			fmt.Fprintf(os.Stderr, "gaffer: %s still stopping after %ds; going down anyway (interrupted, they follow their kind's policy)\n", strings.Join(ids, " "), *wait)
+			os.Exit(1)
+		}
+	}
+}

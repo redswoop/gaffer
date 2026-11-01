@@ -108,6 +108,42 @@ check "rebooted job finishes"         state "$j" needs-you 60
 check "events say machine rebooted"   eval 'g show "$j" | grep -q "machine rebooted"'
 check "resumed at the last checkpoint" resumed_at_last "$j"
 
+echo "-- shutdown without the hook: the OS TERMs the step, it exits 0, the box reboots"
+j=$(submit fake --host alpha -e FAKE_SLEEP=0.3 -e FAKE_TERM_RC=0 -- 30)
+done_ge "$j" 7 30; kill9 alpha; kill -TERM -"$(jobpg "$j")"; sleep 2; BOOT=simulated-reboot-2; start_agent alpha
+check "unwatched exit 0 = interrupted" eval 'wait_for "$j" "(.attempt==2)" 30 && g show "$j" | grep -q "exited 0 unwatched"'
+check "  job finishes on attempt 2"    state "$j" needs-you 60
+check "  from the TERM checkpoint"     resumed_at_last "$j"
+
+echo "-- a stop signal gaffer didn't send (logout, a stray kill): interrupted, not failed"
+j=$(submit fake --host alpha -e FAKE_SLEEP=0.3 -- 30)
+done_ge "$j" 7 30; kill -HUP -"$(jobpg "$j")"
+check "HUP from outside = interrupted"  eval 'wait_for "$j" "(.attempt==2)" 30 && g show "$j" | grep -q "killed by SIGHUP from outside gaffer"'
+check "  not a failure: host not held" eq "$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.held')" false
+check "  job finishes on attempt 2"    state "$j" needs-you 60
+
+echo "-- hold / release / drain / shutdown"
+g hold alpha >/dev/null
+j=$(submit fake --host alpha -e FAKE_SLEEP=0.3 -- 30); sleep 3
+check "held host takes nothing"       eq "$(f "$j" .state)/$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.held')" "queued/true"
+check "the board says so"             eval 'g ls | grep -q "alpha HELD: held by hand"'
+g release alpha >/dev/null
+check "released: it runs"             done_ge "$j" 3 30
+check "drain pauses what runs there"  eval 'g drain alpha | grep -q "^#$j -> " && state "$j" paused 20'
+check "  and holds the host"          eq "$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.held')" true
+g release alpha >/dev/null; p=$(f "$j" .progress.done); g resume "$j" >/dev/null
+wait_for "$j" '(.attempt==2 and .state=="running")' 30 >/dev/null; done_ge "$j" $((p+2)) 30 >/dev/null
+kill9 controller   # the network is the first thing to go at shutdown: the hook must not need it
+check "shutdown pauses without the controller" eval 'timeout 30 "$BIN" shutdown 2>&1 | tee "$T/shutdown.out" | grep -q "1 paused, safe to go down"'
+check "  nothing left running"        eq "$(jq -r .state "$T/alpha/jobs/$j/job.json")" stopped
+kill9 alpha; BOOT=simulated-reboot-3; start_controller; start_agent alpha
+check "  reported after the reboot: paused" state "$j" paused 30
+g resume "$j" >/dev/null
+check "  and resumes from there"      state "$j" needs-you 60
+check "  inside the step"             haslog "$j" "resuming at unit"
+check "shutdown with nothing running" eval '"$BIN" shutdown | grep -q "nothing running here"'
+check "a second agent is refused"     eval 'GAFFER_CONFIG=$T/alpha.toml timeout 10 "$BIN" agent 2>&1 | grep -q "another agent holds"'
+
 echo "-- pause = TERM, checkpoint, free the slot; resume picks up there"
 j=$(submit fake --host alpha -e FAKE_SLEEP=0.3 -- 40)
 done_ge "$j" 8 30; g pause "$j" >/dev/null
@@ -129,14 +165,14 @@ g resume "$j" >/dev/null
 check "  resumed job finishes"           state "$j" needs-you 60
 check "  from the TERM checkpoint"       haslog "$j" "resuming at unit"
 
-echo "-- failure, then the circuit breaker drains the host"
+echo "-- failure, then the circuit breaker holds the host"
 x=$(submit fake --host alpha -e FAKE_SLEEP=0.1 -e FAKE_FAIL=3 -- 10)
 check "failed"                        state "$x" failed 30
 check "reason names the error"        eval 'f "$x" .reason | grep -q "fake failure at unit 3"'
 y=$(submit fake --host alpha -e FAKE_SLEEP=0.1 -e FAKE_FAIL=2 -- 10)
 state "$y" failed 30 >/dev/null
-check "two in a row drains alpha"     eq "$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.drained')" true
-g undrain alpha >/dev/null
+check "two in a row holds alpha"      eq "$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.held')" true
+g release alpha >/dev/null
 check "retry from scratch"            eval 'g retry "$x" >/dev/null && wait_for "$x" "(.state==\"running\")" 20'
 g cancel "$x" >/dev/null; state "$x" canceled 20 >/dev/null
 check "ack files a failure, keeps it"   eval 'g ack "$y" >/dev/null && [ "$(f "$y" .state)" = failed ] && [ "$(f "$y" .acked)" -gt 0 ]'
@@ -236,6 +272,10 @@ check "source says done: failure filed" wait_for "$a4" '((.acked // 0) > 0)' 15
 check "and says why"                  eval 'g show "$a4" | grep -q "is done per ext"'
 a3=$(g again "$h" | actid)
 check "kind action, from its kind dir" eval 'state "$a3" done 30 && wait_for "$a3" "(.log_size > 0)" 10 && haslog "$a3" "hello again from $T/kinds/hello"'
+a5=$(g ship "$b" | actid)
+check "kind action on a review item"   state "$a5" done 30
+check "  files the review: done"       eval 'wait_for "$b" "(.state==\"done\" and .reason==\"ship #$a5 done\")" 10'
+check "  and says so"                  eval 'g show "$b" | grep -q "review closed by ship #$a5 done"'
 : > "$T/obs.txt"
 
 echo "-- an observer taken out of the config is retired, not silent"

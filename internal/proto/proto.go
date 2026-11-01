@@ -182,7 +182,7 @@ type Host struct {
 	Used     map[string]int `json:"used"`
 	Seen     int64          `json:"seen"`
 	Online   bool           `json:"online"`
-	Drained  bool           `json:"drained"`
+	Held     bool           `json:"held"` // takes no new work (by hand, the breaker, or a shutdown in progress)
 	Note     string         `json:"note,omitempty"`
 	Failures int            `json:"failures"`
 }

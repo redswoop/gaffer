@@ -85,9 +85,9 @@ func (c *Controller) routes() http.Handler {
 		defer c.mu.Unlock()
 		h := r.PathValue("host")
 		switch r.PathValue("verb") {
-		case "drain":
-			c.db.Exec("UPDATE hosts SET drained=1, note='drained by hand' WHERE host=?", h)
-		case "undrain":
+		case "hold": // takes no new work; running jobs are untouched (`gaffer drain` pauses them too, client side)
+			c.db.Exec("UPDATE hosts SET drained=1, note='held by hand' WHERE host=?", h)
+		case "release":
 			c.db.Exec("UPDATE hosts SET drained=0, failures=0, note='' WHERE host=?", h)
 		default:
 			http.Error(w, "unknown verb", 400)

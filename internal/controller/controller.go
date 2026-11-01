@@ -108,7 +108,7 @@ func (c *Controller) sync(req proto.SyncReq) proto.SyncResp {
 		boot_id=excluded.boot_id, version=excluded.version, slots=excluded.slots, seen=excluded.seen, offline_alerted=0`,
 		req.Host, req.BootID, req.Version, js(req.Slots), t)
 	if prevBoot != "" && prevBoot != req.BootID {
-		c.alert("gaffer: "+req.Host+" rebooted", "agent is back; interrupted jobs follow their kind's policy", "default", "arrows_counterclockwise")
+		c.alert("gaffer: "+req.Host+" rebooted", "agent is back; paused jobs wait for `gaffer resume`, interrupted ones follow their kind's policy", "default", "arrows_counterclockwise")
 	} else if offlineAlerted {
 		c.alert("gaffer: "+req.Host+" back online", "", "low", "white_check_mark")
 	}
@@ -337,17 +337,17 @@ func (c *Controller) breaker(host string) {
 	var n int
 	c.db.QueryRow("UPDATE hosts SET failures=failures+1 WHERE host=? RETURNING failures", host).Scan(&n)
 	if n >= breakerFailures {
-		c.db.Exec("UPDATE hosts SET drained=1, note=? WHERE host=?", fmt.Sprintf("auto-drained after %d failures in a row", n), host)
-		c.alert("gaffer: "+host+" drained", fmt.Sprintf("%d failures in a row; fix, then `gaffer undrain %s`", n, host), "high", "rotating_light")
+		c.db.Exec("UPDATE hosts SET drained=1, note=? WHERE host=?", fmt.Sprintf("held after %d failures in a row", n), host)
+		c.alert("gaffer: "+host+" held", fmt.Sprintf("%d failures in a row; fix, then `gaffer release %s`", n, host), "high", "rotating_light")
 	}
 }
 
 // schedule hands queued work to this host: priority then age, while it has free slots of the
 // label a job needs. A job pinned by host or checkpoint affinity only goes there.
 func (c *Controller) schedule(req proto.SyncReq) []proto.Assign {
-	var drained bool
-	c.db.QueryRow("SELECT drained FROM hosts WHERE host=?", req.Host).Scan(&drained)
-	if drained {
+	var held bool // the `drained` column: held by hand, by the breaker, or by a shutdown in progress
+	c.db.QueryRow("SELECT drained FROM hosts WHERE host=?", req.Host).Scan(&held)
+	if held {
 		return nil
 	}
 	used := map[string]int{}
@@ -487,7 +487,7 @@ func (c *Controller) status(all bool) proto.Status {
 		for rows.Next() {
 			var h proto.Host
 			var slots string
-			rows.Scan(&h.Host, &h.BootID, &h.Version, &slots, &h.Seen, &h.Drained, &h.Note, &h.Failures)
+			rows.Scan(&h.Host, &h.BootID, &h.Version, &slots, &h.Seen, &h.Held, &h.Note, &h.Failures)
 			json.Unmarshal([]byte(slots), &h.Slots)
 			h.Online = t-h.Seen < offlineAfter
 			h.Used = map[string]int{}
