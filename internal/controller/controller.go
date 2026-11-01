@@ -98,13 +98,6 @@ func active(state string) bool {
 	return state == proto.SAssigned || state == proto.SRunning || state == proto.SStopping
 }
 
-func needs(s proto.Spec) string {
-	if s.Needs == "" {
-		return "cpu"
-	}
-	return s.Needs
-}
-
 // sync is the whole agent protocol: fold the reports in, re-send what the agent should be doing,
 // hand out new work, acknowledge finished attempts once their full log is here.
 func (c *Controller) sync(req proto.SyncReq) proto.SyncResp {
@@ -371,12 +364,12 @@ func (c *Controller) schedule(req proto.SyncReq) []proto.Assign {
 	}
 	used := map[string]int{}
 	for _, it := range c.query("WHERE host=? AND state IN ('assigned','running','stopping') AND observed=0", req.Host) {
-		used[needs(it.Spec)]++
+		used[it.Spec.NeedsAt(it.Step)]++
 	}
 	t := nowMS()
 	var out []proto.Assign
 	for _, it := range c.query("WHERE state='queued' AND observed=0 ORDER BY priority, id") {
-		n := needs(it.Spec)
+		n := it.Spec.NeedsAt(it.Step)
 		if req.Slots[n] <= used[n] {
 			continue
 		}
@@ -529,7 +522,7 @@ func (c *Controller) status(all bool) proto.Status {
 		st.Items = append(st.Items, c.derive(it, t))
 		for i := range st.Hosts {
 			if st.Hosts[i].Host == it.Host && active(it.State) && !it.Observed {
-				st.Hosts[i].Used[needs(it.Spec)]++
+				st.Hosts[i].Used[it.Spec.NeedsAt(it.Step)]++
 			}
 		}
 	}

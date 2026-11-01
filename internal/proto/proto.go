@@ -5,8 +5,20 @@ package proto
 // picks up at the next step without asking the kind; resuming inside a step is the kind's business
 // (::checkpoint + W_RESUME).
 type Step struct {
-	Name string `json:"name" toml:"name"`
-	Run  string `json:"run" toml:"run"`
+	Name  string `json:"name" toml:"name"`
+	Run   string `json:"run" toml:"run"`
+	Needs string `json:"needs,omitempty" toml:"needs"` // this step's slot label; "" = the kind's
+}
+
+// Needs is the slot label the job occupies while on step i: the step's own, else the kind's, else cpu.
+func (s Spec) NeedsAt(i int) string {
+	if i >= 0 && i < len(s.Steps) && s.Steps[i].Needs != "" {
+		return s.Steps[i].Needs
+	}
+	if s.Needs == "" {
+		return "cpu"
+	}
+	return s.Needs
 }
 
 // Spec is everything an agent needs to run a job. It is resolved from the kind manifest at submit
@@ -19,7 +31,7 @@ type Spec struct {
 	Cwd           string            `json:"cwd,omitempty"`
 	Steps         []Step            `json:"steps"`
 	OnInterrupt   string            `json:"on_interrupt,omitempty"` // resume (default) | restart | hold
-	Needs         string            `json:"needs,omitempty"`        // slot label; "" = cpu
+	Needs         string            `json:"needs,omitempty"`        // slot label; "" = cpu; a step may override (NeedsAt)
 	Host          string            `json:"host,omitempty"`         // pin to one agent
 	StopGrace     int               `json:"stop_grace,omitempty"`   // seconds between TERM and KILL
 	StallAfter    int               `json:"stall_after,omitempty"`  // seconds without progress -> stalled

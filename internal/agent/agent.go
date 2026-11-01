@@ -306,7 +306,9 @@ func (a *Agent) start(as proto.Assign) {
 	} else if as.Step > 0 {
 		how = "from step " + j.Spec.Steps[as.Step].Name
 	}
-	if j.Spec.Fits != "" { // before the banner: a "not now" leaves no trace in the job's log
+	// fits guards a resource (VRAM, a lease): it runs before a step that needs a slot beyond the default
+	// cpu, and before the banner, so a "not now" leaves no trace in the job's log.
+	if j.Spec.Fits != "" && j.Spec.NeedsAt(j.Step) != "cpu" {
 		if out, ok := a.runAux(j, j.Spec.Fits, 60*time.Second); !ok {
 			lines := strings.Split(strings.TrimSpace(out), "\n")
 			a.end(j, proto.JRejected, trunc(lines[len(lines)-1], 200), t)

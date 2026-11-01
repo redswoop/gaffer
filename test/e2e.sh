@@ -21,7 +21,7 @@ kinds = ["$T/kinds", "$ROOT/kinds"]
 [agent]
 host = "$1"
 dir = "$T/$1"
-slots = { cpu = 2 }
+slots = { cpu = 2, gpu = 1 }
 EOT
 }
 conf alpha; conf beta
@@ -45,10 +45,25 @@ printf '#!/bin/bash\necho "hello $1 from $W_KIND_DIR"\n' > "$T/kinds/hello/say"
 printf '#!/bin/bash\n[ -e %s/obs.fail ] && { echo "source unreachable" >&2; exit 1; }\ncat %s/obs.txt 2>/dev/null; true\n' "$T" "$T" > "$T/observe"
 # the ship action: quick, except for key s2, which takes long enough to be killed mid-ship
 printf '#!/bin/bash\necho "shipping $W_KEY for #$W_ITEM"\n[ "$W_KEY" = s2 ] && sleep 60\n[ "$W_KEY" != s3 ]\n' > "$T/ship"
-chmod +x "$T/kinds/hello/say" "$T/observe" "$T/ship"
+# staged: a gpu step, then a cpu step; each prints progress so the suite can see where it is
+mkdir -p "$T/kinds/staged"
+cat > "$T/kinds/staged/kind.toml" <<'EOT'
+title = "staged {{1}}"
+needs = "gpu"
+stop_grace = 5
+[[steps]]
+name = "render"
+run = '$W_KIND_DIR/stage "$@"'
+[[steps]]
+name = "verify"
+run = '$W_KIND_DIR/stage "$@"'
+needs = "cpu"
+EOT
+printf '#!/bin/bash\nfor i in $(seq "$1"); do echo "::progress done=$i total=$1"; sleep 0.5; done\n' > "$T/kinds/staged/stage"
+chmod +x "$T/kinds/hello/say" "$T/observe" "$T/ship" "$T/kinds/staged/stage"
 export GAFFER_CONFIG=$T/alpha.toml
 
-start_controller() { GAFFER_REJECT_BACKOFF=3 setsid "$BIN" controller >> "$T/controller.log" 2>&1 & echo $! > "$T/controller.pid"
+start_controller() { GAFFER_REJECT_BACKOFF=6 setsid "$BIN" controller >> "$T/controller.log" 2>&1 & echo $! > "$T/controller.pid"
   for _ in $(seq 50); do [ -s "$T/token" ] && "$BIN" ls >/dev/null 2>&1 && return; sleep 0.1; done; echo "controller didn't come up"; exit 1; }
 start_agent() { GAFFER_CONFIG=$T/$1.toml GAFFER_BOOT_ID=$BOOT setsid "$BIN" agent >> "$T/$1.log" 2>&1 & echo $! > "$T/$1.pid"; }
 kill9() { kill -9 "$(cat "$T/$1.pid")" 2>/dev/null; sleep 0.3; }
@@ -122,22 +137,34 @@ check "HUP from outside = interrupted"  eval 'wait_for "$j" "(.attempt==2)" 30 &
 check "  not a failure: host not held" eq "$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.held')" false
 check "  job finishes on attempt 2"    state "$j" needs-you 60
 
-echo "-- fits: a rejection is not an attempt, retries go in queue order"
+echo "-- fits: a rejection is not an attempt; when the resource frees between beats the queue head goes first"
 touch "$T/nofit"
-fa=$(submit fake --host alpha -e FAKE_NOFIT=$T/nofit -e FAKE_SLEEP=0.3 -- 30); sleep 1.5
-fb=$(submit fake --host alpha -e FAKE_NOFIT=$T/nofit -e FAKE_SLEEP=0.3 -- 30); sleep 1.5
-fc=$(submit fake --host alpha -e FAKE_NOFIT=$T/nofit -e FAKE_SLEEP=0.3 -- 30)
-check "rejected items wait, visibly"   wait_for "$fc" '(.state=="queued" and ((.reason // "")|test("waiting: alpha: blocked by nofit")))' 20
-sleep 9   # several retry beats (GAFFER_REJECT_BACKOFF=3 below) with nothing fitting
-check "  retries don't count as attempts" eq "$(f "$fa" .attempt)/$(f "$fb" .attempt)/$(f "$fc" .attempt)" 0/0/0
+fa=$(submit fake --host alpha --needs gpu -e FAKE_NOFIT=$T/nofit -e FAKE_SLEEP=0.2 -- 10); sleep 1.5
+fb=$(submit fake --host alpha --needs gpu -e FAKE_NOFIT=$T/nofit -e FAKE_SLEEP=0.2 -- 10)
+check "rejected items wait, visibly"   wait_for "$fb" '(.state=="queued" and ((.reason // "")|test("waiting: alpha: blocked by nofit")))' 20
+sleep 13  # a couple of retry beats (GAFFER_REJECT_BACKOFF=6 at start_controller) with nothing fitting
+# with one slot a beat probes the items one sync at a time, head first (~2 s each); the moment after the last one is
+# turned down, both are back in the queue (an item mid-probe is "assigned", attempt 1, for a second or two)
+rejected_again() { local was; was=$(jq -r .finished "$T/alpha/jobs/$1/job.json")
+  for _ in $(seq 100); do [ "$(jq -r .finished "$T/alpha/jobs/$1/job.json")" != "$was" ] && return 0; sleep 0.1; done; return 1; }
+rejected_again "$fb"; state "$fb" queued 5 >/dev/null   # and the controller has heard
+check "  retries don't count as attempts" eq "$(f "$fa" .attempt)/$(f "$fb" .attempt)" 0/0
 check "  one event, not one per retry"    eq "$(g show "$fa" | grep -c '  waiting  ')" 1
 check "  log untouched by the retries"    eval '[ "$(g log -n 100000 "$fa" | grep -c "gaffer: #")" = 0 ]'
-rm "$T/nofit"
-check "fits again: the queue head runs"  eval 'state "$fa" running 20 && state "$fb" running 20'
-check "  not the youngest"               eq "$(f "$fc" .state)" queued
+rejected_again "$fb"; state "$fb" queued 5 >/dev/null; rm "$T/nofit"   # frees up between beats: the next beat starts at the head
+check "fits again: the queue head runs"  eval 'state "$fa" running 20 && sleep 1'
+check "  the other waits for the slot"   eq "$(f "$fb" .state)" queued
 check "  attempt 1 once it really runs"  eq "$(f "$fa" .attempt)" 1
-check "  the three finish"               eval 'state "$fa" needs-you 60 && state "$fb" needs-you 60 && state "$fc" needs-you 60'
-g ack "$fa" "$fb" "$fc" >/dev/null
+check "  both finish"                    eval 'state "$fa" needs-you 60 && state "$fb" needs-you 60'
+g ack "$fa" "$fb" >/dev/null
+
+echo "-- a step's own slot: the gpu is handed back when the render step ends"
+s1=$(submit staged --host alpha -- 6); s2=$(submit staged --host alpha -- 6)
+check "one gpu slot: the second waits"   eval 'state "$s1" running 20 && sleep 1 && eq "$(f "$s2" .state)" queued'
+check "  the gpu is in use"              eq "$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.used.gpu')" 1
+check "render done: next render starts" eval 'wait_for "$s1" "(.step==1)" 30 && state "$s2" running 10'
+check "  both on the board, one gpu"     eq "$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.used.gpu')" 1
+check "  the two finish"                 eval 'state "$s1" done 60 && state "$s2" done 60'
 
 echo "-- hold / release / drain / shutdown"
 g hold alpha >/dev/null

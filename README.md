@@ -174,11 +174,12 @@ the job, so editing a kind never changes a queued job. Each agent sets `W_KIND_D
 ```toml
 title = "fake {{1}} units"        # {{args}}, {{1}}..{{9}}
 on_interrupt = "resume"           # resume | restart | hold
-needs = "gpu"                     # slot label; agents advertise slots = { gpu = 1, cpu = 4 }
+needs = "gpu"                     # slot label; agents advertise slots = { gpu = 1, cpu = 4 }; a step may override
 stop_grace = 30
 stall_after = 600
 review = true                     # finish in needs-you; `gaffer ack` = done
-fits = '$W_KIND_DIR/fits'         # nonzero exit = not now (VRAM, a lease); output = the reason; retried every 30 s, queue order
+fits = '$W_KIND_DIR/fits'         # before a step that needs a slot: nonzero exit = not now (VRAM, a lease); output = the
+                                  # reason; retried every 30 s, head of the queue first
 progress_regex = '...'
 progress_poll = '$W_KIND_DIR/poll "$@"'
 poll_every = 15
@@ -186,7 +187,15 @@ poll_every = 15
 [[steps]]
 name = "render"
 run = '$W_KIND_DIR/render "$@"'   # bash -c; "$@" = the job's args
+
+[[steps]]
+name = "verify"
+run = '$W_KIND_DIR/verify "$@"'
+needs = "cpu"                     # holds a cpu slot, not the gpu: the next render starts while this checks
 ```
+
+A job occupies the slot of the step it is on, so a kind whose later steps only need `cpu` hands the
+`gpu` back as soon as the render step ends.
 
 Step environment: `W_ID W_ATTEMPT W_STEP W_STEP_NAME W_JOBDIR W_STATE W_LOG W_HOST W_KIND_DIR W_RESUME`
 (+ `W_CHECKPOINT`, `W_CKPT_*` on resume), the kind's `env`, `-e` from submit, and `gaffer` on `PATH`.
@@ -230,7 +239,7 @@ go test ./... && ./test/e2e.sh
 `kill -9` mid-step (adopted, same attempt), job `kill -9` (resumed from checkpoint), simulated reboot
 (new boot id), a step's unwatched exit 0 before a reboot, pause/resume through a TERM checkpoint, failure + breaker +
 ack of a failure, stall, a question mid-run, a step killed by a stray HUP, a fits check saying not now (no attempt, no
-event spam, queue order when it fits again), hold/release/drain of a host, the shutdown hook with the controller unreachable,
+event spam, the queue head first when it fits again), a step that needs a different slot than its kind, hold/release/drain of a host, the shutdown hook with the controller unreachable,
 controller `kill -9` (job unaffected, full log arrives), restart policy, observed work, a kind from a
 second kinds dir, observers (snapshot in, progress follows, ack sticks, a failing observer changes
 nothing, gone = done), actions (a job on the owner's host, refused when not on offer or already
