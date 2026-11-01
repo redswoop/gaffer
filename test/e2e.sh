@@ -26,12 +26,22 @@ EOT
 }
 conf alpha; conf beta
 cat >> "$T/alpha.toml" <<EOT
+[agent.resources.gpu]
+probe = "$T/probe"
+release = "$T/release"
+idle_mib = 1500
+every = 2
 [[agent.observe]]
 name = "ext"
 run = "$T/observe"
 every = 2
 actions = { ship = '$T/ship' }
 EOT
+# the gpu probe reads probe.used / probe.procs; the release hook marks that it ran and clears the use
+# (unless release.off exists: then it stands for a hook that can't help)
+echo 0 > "$T/probe.used"; : > "$T/probe.procs"
+printf '#!/bin/bash\necho "used=$(cat %s/probe.used) total=24000"\ncat %s/probe.procs\n' "$T" "$T" > "$T/probe"
+printf '#!/bin/bash\n[ -e %s/release.off ] && exit 0\necho "$GAFFER_RES $GAFFER_HOLDERS waiting=$GAFFER_WAITING_FOR" > %s/released\necho 0 > %s/probe.used\n' "$T" "$T" "$T" > "$T/release"
 mkdir -p "$T/kinds/hello"
 cat > "$T/kinds/hello/kind.toml" <<'EOT'
 title = "hello {{1}}"
@@ -60,10 +70,10 @@ run = '$W_KIND_DIR/stage "$@"'
 needs = "cpu"
 EOT
 printf '#!/bin/bash\nfor i in $(seq "$1"); do echo "::progress done=$i total=$1"; sleep 0.5; done\n' > "$T/kinds/staged/stage"
-chmod +x "$T/kinds/hello/say" "$T/observe" "$T/ship" "$T/kinds/staged/stage"
+chmod +x "$T/kinds/hello/say" "$T/observe" "$T/ship" "$T/kinds/staged/stage" "$T/probe" "$T/release"
 export GAFFER_CONFIG=$T/alpha.toml
 
-start_controller() { GAFFER_REJECT_BACKOFF=6 setsid "$BIN" controller >> "$T/controller.log" 2>&1 & echo $! > "$T/controller.pid"
+start_controller() { GAFFER_REJECT_BACKOFF=6 GAFFER_YIELD_DEBOUNCE=2 GAFFER_PREEMPT_BACKOFF=20 setsid "$BIN" controller >> "$T/controller.log" 2>&1 & echo $! > "$T/controller.pid"
   for _ in $(seq 50); do [ -s "$T/token" ] && "$BIN" ls >/dev/null 2>&1 && return; sleep 0.1; done; echo "controller didn't come up"; exit 1; }
 start_agent() { GAFFER_CONFIG=$T/$1.toml GAFFER_BOOT_ID=$BOOT setsid "$BIN" agent >> "$T/$1.log" 2>&1 & echo $! > "$T/$1.pid"; }
 kill9() { kill -9 "$(cat "$T/$1.pid")" 2>/dev/null; sleep 0.3; }
@@ -84,7 +94,8 @@ jobpg() { local id=$1 a; a=$(jq -r .attempt "$T/${2:-alpha}/jobs/$id/job.json");
 eq() { [ "$1" = "$2" ] || { echo "    got '$1', want '$2'"; return 1; }; }
 haslog() { g log -n 100000 "$1" | grep -q "$2" || { echo "    log of #$1 lacks '$2'"; return 1; }; }
 # the resume point must be the last ::checkpoint printed before the interrupt, whatever the timing
-resumed_at_last() { g log -n 100000 "$1" | awk '/^::checkpoint unit=/{split($2,a,"="); last=a[2]} /^──── gaffer: .* attempt 2 /{want=last} /^resuming at unit /{got=$4} END{if (want=="" || got!=want) {print "    resumed at \"" got "\", last checkpoint before the interrupt was \"" want "\""; exit 1}}'; }
+resumed_at_last() { local i; for i in $(seq 40); do g log -n 100000 "$1" | grep -q "^resuming at unit" && break; sleep 0.25; done   # the log lags the state by a sync or two
+  g log -n 100000 "$1" | awk '/^::checkpoint unit=/{split($2,a,"="); last=a[2]} /^──── gaffer: .* attempt 2 /{want=last} /^resuming at unit /{got=$4} END{if (want=="" || got!=want) {print "    resumed at \"" got "\", last checkpoint before the interrupt was \"" want "\""; exit 1}}'; }
 lacks() { ! g log -n 100000 "$1" | grep -q "$2" || { echo "    log of #$1 has '$2'"; return 1; }; }
 
 start_controller; start_agent alpha
@@ -161,31 +172,50 @@ g ack "$fa" "$fb" >/dev/null
 echo "-- a step's own slot: the gpu is handed back when the render step ends"
 s1=$(submit staged --host alpha -- 6); s2=$(submit staged --host alpha -- 6)
 check "one gpu slot: the second waits"   eval 'state "$s1" running 20 && sleep 1 && eq "$(f "$s2" .state)" queued'
+check "  and says behind whom"           wait_for "$s2" '((.reason // "")|test("behind #'"$s1"' for gpu"))' 10
 check "  the gpu is in use"              eq "$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.used.gpu')" 1
 check "render done: next render starts" eval 'wait_for "$s1" "(.step==1)" 30 && state "$s2" running 10'
 check "  both on the board, one gpu"     eq "$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.used.gpu')" 1
 check "  the two finish"                 eval 'state "$s1" done 60 && state "$s2" done 60'
 
-echo "-- hold / release / drain / shutdown"
-g hold alpha >/dev/null
-j=$(submit fake --host alpha -e FAKE_SLEEP=0.3 -- 30); sleep 3
+echo "-- host hold / release / drain / shutdown"
+g host hold alpha >/dev/null
+j=$(submit fake --host alpha -e FAKE_SLEEP=0.3 -- 90); sleep 3
 check "held host takes nothing"       eq "$(f "$j" .state)/$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.held')" "queued/true"
 check "the board says so"             eval 'g ls | grep -q "alpha HELD: held by hand"'
-g release alpha >/dev/null
+check "unknown host is an error"      eval '! g host hold nowhere 2>/dev/null'
+check "release is a host verb only"   eval '! g release "$j" 2>/dev/null'
+g top "$j" >/dev/null; g top "$j" >/dev/null; g top "$j" >/dev/null
+check "show folds repeated events"    eval 'g show "$j" | grep -q "top .*×3"'
+check "show prints the priority"      eval 'g show "$j" | grep -q "^  priority "'
+g host release alpha >/dev/null
 check "released: it runs"             done_ge "$j" 3 30
-check "drain pauses what runs there"  eval 'g drain alpha | grep -q "^#$j -> " && state "$j" paused 20'
+check "drain pauses what runs there"  eval 'g host drain alpha | grep -q "^#$j -> " && state "$j" paused 20'
 check "  and holds the host"          eq "$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.held')" true
-g release alpha >/dev/null; p=$(f "$j" .progress.done); g resume "$j" >/dev/null
+check "  paused by you, with a hint"  eval 'eq "$(f "$j" .paused_by)" human && g ls | grep -q "by you.*→ gaffer resume $j"'
+g host release alpha >/dev/null; p=$(f "$j" .progress.done); g resume "$j" >/dev/null
 wait_for "$j" '(.attempt==2 and .state=="running")' 30 >/dev/null; done_ge "$j" $((p+2)) 30 >/dev/null
+hp=$(submit fake --host alpha -e FAKE_SLEEP=0.3 -- 30); done_ge "$hp" 2 30; g pause "$hp" >/dev/null; state "$hp" paused 20 >/dev/null
 kill9 controller   # the network is the first thing to go at shutdown: the hook must not need it
 check "shutdown pauses without the controller" eval 'timeout 30 "$BIN" shutdown 2>&1 | tee "$T/shutdown.out" | grep -q "1 paused, safe to go down"'
 check "  nothing left running"        eq "$(jq -r .state "$T/alpha/jobs/$j/job.json")" stopped
 kill9 alpha; BOOT=simulated-reboot-3; start_controller; start_agent alpha
-check "  reported after the reboot: paused" state "$j" paused 30
-g resume "$j" >/dev/null
-check "  and resumes from there"      state "$j" needs-you 60
+check "  back after the reboot: resumes by itself" eval 'wait_for "$j" "(.attempt==3)" 30 && g show "$j" | grep -q "alpha is back"'
+check "  and finishes from there"     state "$j" needs-you 60
 check "  inside the step"             haslog "$j" "resuming at unit"
+check "  a pause by hand stays paused" eq "$(f "$hp" .state)/$(f "$hp" .paused_by)" paused/human
+g cancel "$hp" >/dev/null
 check "shutdown with nothing running" eval '"$BIN" shutdown | grep -q "nothing running here"'
+ti=$(submit fake --host alpha -e FAKE_SLEEP=0.3 -e FAKE_TERM_IGNORE=1 -- 60); done_ge "$ti" 2 30
+( timeout 40 "$BIN" shutdown --wait 30 > "$T/shutdown2.out" 2>&1 ) & sd=$!; sleep 2
+tq=$(submit fake --host alpha -e FAKE_SLEEP=0.2 -- 5)
+check "pause-all holds the host meanwhile" eval 'sleep 3 && eq "$(f "$tq" .state)" queued && g ls | grep -q "alpha HELD: pausing everything for a shutdown"'
+check "  the board says stopping…"    eval 'g ls | grep -q "stopping… (pause, shutdown)"'
+wait $sd
+check "  a TERM-proof step is KILLed"  eval 'grep -q "1 paused" "$T/shutdown2.out" && wait_for "$ti" "(.state==\"paused\" and .paused_by==\"shutdown\")" 10'
+rm -f "$T/alpha/pause-all"   # the box didn't go down after all
+check "  hold lifts with the file"     state "$tq" needs-you 30
+g cancel "$ti" >/dev/null; g ack "$tq" >/dev/null
 check "a second agent is refused"     eval 'GAFFER_CONFIG=$T/alpha.toml timeout 10 "$BIN" agent 2>&1 | grep -q "another agent holds"'
 
 echo "-- pause = TERM, checkpoint, free the slot; resume picks up there"
@@ -200,6 +230,7 @@ check "checkpoint taken on TERM"      wait_for "$j" '((.checkpoint.data.unit|ton
 g resume "$j" >/dev/null
 check "resumed job finishes"          state "$j" needs-you 60
 check "resumed at the TERM checkpoint" haslog "$j" "resuming at unit"
+check "ran time is per attempt"       eval 'g show "$j" | grep -q "ran .* over 2 attempts"'
 j=$(submit fake --host alpha -e FAKE_SLEEP=0.3 -- 40)
 done_ge "$j" 3 30; g pause "$j" >/dev/null; state "$j" paused 20 >/dev/null; g cancel "$j" >/dev/null
 check "cancel from paused says canceled" eq "$(f "$j" .reason)" canceled
@@ -220,8 +251,9 @@ check "reason names the error"        eval 'f "$x" .reason | grep -q "fake failu
 y=$(submit fake --host alpha -e FAKE_SLEEP=0.1 -e FAKE_FAIL=2 -- 10)
 state "$y" failed 30 >/dev/null
 check "two in a row holds alpha"      eq "$(g ls --json | jq -r '.hosts[]|select(.host=="alpha")|.held')" true
-g release alpha >/dev/null
+g host release alpha >/dev/null
 check "retry from scratch"            eval 'g retry "$x" >/dev/null && wait_for "$x" "(.state==\"running\")" 20'
+check "  attempt count starts over"    eq "$(f "$x" .attempt)" 1
 g cancel "$x" >/dev/null; state "$x" canceled 20 >/dev/null
 check "ack files a failure, keeps it"   eval 'g ack "$y" >/dev/null && [ "$(f "$y" .state)" = failed ] && [ "$(f "$y" .acked)" -gt 0 ]'
 check "acked failure leaves FAILED"   eval '! g ls | sed -n "/^FAILED/,/^\$/p" | grep -q "^ *$y "'
@@ -337,7 +369,8 @@ check "the source is gone"            eq "$(g ls --json | jq '[.sources[]|select
 
 echo "-- wait: block on many ids, exit code says how it went"
 rc() { "$@" > "$T/wait.out" 2>&1; echo $?; }
-w1=$(submit hello -- one); w2=$(submit hello -- two)
+w1=$(submit hello -- one); w2=$(submit hello --prio 0 -- two)
+check "prio 0 stays 0"                eq "$(f "$w2" .priority)/$(f "$w1" .priority)" 0/100
 check "all done: 0"                   eq "$(rc timeout 30 "$BIN" wait "$w1" "$w2")" 0
 check "a line per item"               eq "$(grep -c '^#[0-9]* done' "$T/wait.out")" 2
 wf=$(submit fake --host alpha -e FAKE_SLEEP=0.1 -e FAKE_FAIL=3 -- 5)
@@ -365,9 +398,87 @@ check "--timeout: 124"                eq "$(rc "$BIN" wait --timeout 2s "$wt")" 
 check "unknown id: 4"                 eq "$(rc "$BIN" wait 999999)" 4
 check "log -f ends when it settles"   eval 'state "$wt" running 20 >/dev/null; g cancel "$wt" >/dev/null; timeout 30 "$BIN" log -f "$wt" >/dev/null'
 
+rid() { g run "$@" | sed -n 's/^#\([0-9]*\) queued.*/\1/p'; }
+
+echo "-- leases: a holder takes the gpu, running gpu work yields, and comes back when it leaves"
+rc() { "$@" > "$T/wait.out" 2>&1; echo $?; }
+lease() { "$BIN" lease "$@" > "$T/lease.out" 2>&1; echo $?; }
+check "lease needs an agent here"     eq "$(GAFFER_CONFIG=$T/beta.toml lease gpu --holder x)" 3
+j=$(submit fake --host alpha --needs gpu -e FAKE_SLEEP=0.3 -- 60); done_ge "$j" 5 30
+check "a lease yields the running gpu job" eval 'eq "$(lease gpu --holder t1 --class llm --ttl 40s --wait)" 0 && grep -q "yielding #$j" "$T/lease.out" && grep -q "^gpu: free" "$T/lease.out"'
+check "  it is yielded, not interrupted" eval 'state "$j" yielded 20 && eq "$(f "$j" .retries)/$(f "$j" .paused_by)" 0/yield'
+check "  and says to whom"            eval 'f "$j" .reason | grep -q "yielding gpu to t1 (llm) on alpha"'
+check "  checkpoint taken on the way out" wait_for "$j" '((.checkpoint.data.unit|tonumber) >= 5)' 5
+check "  the board lists the holder"  eval 'g ls | grep -q "gpu 1/1 (t1 llm"'
+check "  so does gaffer leases"       eval 'g leases | grep -q "gpu *t1 (llm)"'
+check "  yielded is not trouble for wait" eq "$(rc timeout 6 "$BIN" wait "$j")" 124
+k=$(submit fake --host alpha --needs gpu -e FAKE_SLEEP=0.2 -- 12)
+check "queued gpu work waits, says why" wait_for "$k" '(.state=="queued" and ((.reason // "")|test("gpu: t1 \\(llm\\) has it")))' 20
+sleep 6
+check "  one waiting event, not one per beat" eq "$(g show "$k" | grep -c '  waiting  ')" 1
+sh=$(submit fake --host alpha --needs gpu --shares llm -e FAKE_SLEEP=0.2 -- 8)
+check "a sharing job is a co-holder: it runs" state "$sh" running 20
+check "  a lease of another class bumps it" eval 'eq "$(lease gpu --holder t2 --class other --ttl 40s --wait)" 0 && state "$sh" yielded 20'
+check "exclusive is refused while held" eval 'eq "$(lease gpu --holder t3 --exclusive)" 1 && grep -q "refused: gpu: held by t1 (llm)" "$T/lease.out"'
+check "refresh is idempotent"         eval 'eq "$(lease gpu --holder t1 --class llm --ttl 40s)" 0 && grep -q "^gpu: refreshed" "$T/lease.out" && eq "$(g ls --json | jq ".hosts[]|select(.host==\"alpha\")|.leases|length")" 2'
+kill9 alpha; start_agent alpha; sleep 3
+check "leases survive an agent kill -9" eval 'g leases | grep -q "t1 (llm)" && eq "$(f "$j" .state)" yielded'
+lease gpu --holder t2 --release >/dev/null
+check "lease gone: the sharing job comes back" state "$sh" running 20
+state "$sh" needs-you 40 >/dev/null; g ack "$sh" >/dev/null
+check "released: the yielded job runs first" eval 'eq "$(lease gpu --holder t1 --release)" 0 && state "$j" running 20 && eq "$(f "$k" .state)" queued'
+check "  from its checkpoint"          eval 'eq "$(f "$j" .attempt)/$(f "$j" .retries)" 2/0 && resumed_at_last "$j"'
+check "  says why it is back"          eval 'g show "$j" | grep -q "requeued .*t1 (llm) left the gpu"'
+g cancel "$j" >/dev/null; state "$k" needs-you 60 >/dev/null; g ack "$k" >/dev/null
+j3=$(submit fake --host alpha --needs gpu -e FAKE_SLEEP=0.3 -- 40); done_ge "$j3" 3 30
+lease gpu --holder t4 --class llm --ttl 40s --wait >/dev/null; state "$j3" yielded 20 >/dev/null
+g pause "$j3" >/dev/null
+check "a pause by hand beats the yield" eq "$(f "$j3" .state)/$(f "$j3" .paused_by)" paused/human
+lease gpu --holder t4 --release >/dev/null; sleep 5
+check "  and sticks when the lease goes" eq "$(f "$j3" .state)" paused
+g cancel "$j3" >/dev/null
+j4=$(submit fake --host alpha --needs gpu -e FAKE_SLEEP=0.3 -- 40); done_ge "$j4" 3 30
+lease gpu --holder t5 --class llm --ttl 3s --wait >/dev/null
+check "TTL: the lease expires on its own" eval 'state "$j4" yielded 20 && state "$j4" running 20'
+g cancel "$j4" >/dev/null
+"$BIN" lease gpu --holder p1 -- sleep 3017 > "$T/lease-p1.out" 2>&1 & lp=$!; sleep 3
+check "a process lease lives with its command" eval 'g leases | grep -q "gpu *p1 (p1).*while pid"'
+kill -9 $lp 2>/dev/null; pkill -9 -f "sleep 3017"; sleep 4
+check "  and dies with it"            eval '! g leases | grep -q "p1 (p1)"'
+jl=$(rid --needs gpu -- 'gaffer lease gpu --holder me --class x --ttl 20s && sleep 3')
+check "a lease from inside a job doesn't bump it" eval 'state "$jl" done 30 && ! g show "$jl" | grep -q yield'
+lease gpu --holder me --release >/dev/null
+j5=$(submit fake --host alpha --needs gpu -e FAKE_FITS_SLEEP=4 -e FAKE_SLEEP=0.3 -- 20); sleep 1.5
+lease gpu --holder t7 --class llm --ttl 40s >/dev/null; sleep 6
+check "a lease landing during fits is honoured" eval 'eq "$(f "$j5" .state)" queued && lacks "$j5" "gaffer: #"'
+lease gpu --holder t7 --release >/dev/null; state "$j5" running 30 >/dev/null; g cancel "$j5" >/dev/null
+j6=$(submit fake --host alpha --needs gpu -e FAKE_SLEEP=0.3 -e FAKE_TERM_IGNORE=1 -- 60); done_ge "$j6" 3 30
+check "--wait times out honestly"     eval 'eq "$(lease gpu --holder t8 --class llm --wait --timeout 2s)" 1 && grep -q "#$j6 still stopping" "$T/lease.out"'
+check "  KILL after the grace, then yielded" state "$j6" yielded 20
+lease gpu --holder t8 --release >/dev/null; state "$j6" running 20 >/dev/null; g cancel "$j6" >/dev/null
+
+echo "-- resources: the probe says who is on the gpu, the release hook clears idle residents"
+echo 5000 > "$T/probe.used"; rm -f "$T/released"; sleep 4
+r1=$(submit fake --host alpha --needs gpu -e FAKE_SLEEP=0.2 -- 6)
+check "release runs before a gpu job"  eval 'state "$r1" running 20 && grep -q "^gpu  waiting=$" "$T/released"'
+state "$r1" needs-you 30 >/dev/null; g ack "$r1" >/dev/null
+lease gpu --holder t9 --class llm --ttl 40s >/dev/null; echo 5000 > "$T/probe.used"; rm -f "$T/released"; sleep 4
+r2=$(submit fake --host alpha --needs gpu -e FAKE_SLEEP=0.2 -- 6); sleep 5
+check "no release while a lease holds" eval 'eq "$(f "$r2" .state)" queued && [ ! -e "$T/released" ]'
+check "  the header shows the holder, idle" eval 'g ls | grep -q "gpu 1/1 (t9 llm, idle"'
+lease gpu --holder t9 --release >/dev/null
+check "  released: cleared, and it runs" eval 'state "$r2" running 30 && [ -e "$T/released" ]'
+state "$r2" needs-you 30 >/dev/null; g ack "$r2" >/dev/null
+sleep 3019 & fp=$!; echo "$fp sleep 7000" > "$T/probe.procs"; echo 20000 > "$T/probe.used"; touch "$T/release.off"; sleep 6
+check "the header shows a foreign holder" eval 'g ls | grep -q "gpu 0/1 (sleep 6.8G"'
+check "--wait names it"                eval 'eq "$(lease gpu --holder t10 --class llm --wait --timeout 3s)" 1 && grep -q "sleep 6.8G (not gaffer.s)" "$T/lease.out"'
+kill -9 $fp; rm -f "$T/release.off"; lease gpu --holder t10 --release >/dev/null
+echo "999999 ghost 7000" > "$T/probe.procs"; echo 7000 > "$T/probe.used"; sleep 4
+check "a dead pid in the probe is not a resident" eval 'eq "$(lease gpu --holder t11 --class llm --wait --timeout 5s)" 0'
+lease gpu --holder t11 --release >/dev/null; : > "$T/probe.procs"; echo 0 > "$T/probe.used"
+
 echo "-- work runs where it was started; run behaves like typing it"
 start_agent beta; sleep 3
-rid() { g run "$@" | sed -n 's/^#\([0-9]*\) queued.*/\1/p'; }
 ids=""; for _ in 1 2; do ids="$ids $(submit fake -e FAKE_SLEEP=0.2 -- 6)"; done
 bids=""; for _ in 1 2; do bids="$bids $(GAFFER_CONFIG=$T/beta.toml submit fake -e FAKE_SLEEP=0.2 -- 6)"; done
 xb=$(submit fake --host beta -e FAKE_SLEEP=0.2 -- 6)
@@ -383,6 +494,41 @@ r2=$(rid --progress tqdm -- 'printf " 37%%|###   | 3/8 [00:01<00:02, 2.1it/s]\r"
 check "--progress tqdm"               wait_for "$r2" '(.progress.done==3 and .progress.total==8)' 20
 check "unknown preset refused"        eval '! g run --progress nope -- true 2>/dev/null'
 check "no such agent: a note"         eval 'g run --host nowhere -- true 2>&1 | grep -q "no agent \"nowhere\""'
+
+echo "-- preemption: a much more urgent job takes the gpu; the bumped one comes back first"
+pa=$(submit fake --host alpha --needs gpu --prio 100 -e FAKE_SLEEP=0.3 -- 200); done_ge "$pa" 5 30
+pb=$(submit fake --host alpha --needs gpu --prio 40 -e FAKE_SLEEP=0.2 -- 30)
+check "a 50-point gap bumps the holder" eval 'state "$pa" yielded 20 && eq "$(f "$pa" .yield_to)/$(f "$pa" .retries)" "#$pb/0"'
+check "  the urgent one runs"           state "$pb" running 20
+check "  the board says so"             eval 'g ls | grep -q "to #$pb .* resumes when it.s done"'
+pc=$(submit fake --host alpha --needs gpu --prio 100 -e FAKE_SLEEP=0.2 -- 6)
+state "$pb" needs-you 40 >/dev/null; g ack "$pb" >/dev/null
+check "the bumped one returns first"    eval 'state "$pa" running 20 && eq "$(f "$pc" .state)" queued'
+check "  from its checkpoint"           resumed_at_last "$pa"
+pd=$(submit fake --host alpha --needs gpu --prio 60 -e FAKE_SLEEP=0.2 -- 6); sleep 6
+check "a smaller gap does not bump"     eval 'eq "$(f "$pa" .state)" running && f "$pd" .reason | grep -q "behind #$pa for gpu"'
+g cancel "$pa" "$pc" "$pd" >/dev/null
+pr=$(submit fake --host alpha --needs gpu --prio 100 --on-interrupt restart -e FAKE_SLEEP=0.3 -- 60); done_ge "$pr" 3 30
+pu=$(submit fake --host alpha --needs gpu --prio 0 -e FAKE_SLEEP=0.2 -- 6); sleep 6
+check "a restart-policy job is never bumped" eval 'eq "$(f "$pr" .state)" running && eq "$(f "$pu" .state)" queued'
+g cancel "$pr" >/dev/null; state "$pu" needs-you 40 >/dev/null; g ack "$pu" >/dev/null
+pv=$(submit fake --host alpha --needs gpu --prio 100 -e FAKE_SLEEP=0.3 -- 200); done_ge "$pv" 3 30
+touch "$T/nofit2"
+pw=$(submit fake --host alpha --needs gpu --prio 0 -e FAKE_NOFIT=$T/nofit2 -e FAKE_SLEEP=0.2 -- 6)
+check "a preemptor that can't start gives the slot back" eval 'wait_for "$pv" "(.state==\"running\" and .attempt==2)" 30 && g show "$pv" | grep -q "  yielded  " && g show "$pw" | grep -q "preempt backoff"'
+sleep 6
+check "  and stops bumping for a while"  eq "$(f "$pv" .state)/$(f "$pw" .state)" running/queued
+rm "$T/nofit2"
+check "  once it fits, it bumps and runs" eval 'state "$pw" running 30'
+g cancel "$pv" >/dev/null; state "$pw" needs-you 40 >/dev/null; g ack "$pw" >/dev/null
+conf beta; sed -i 's/slots = .*/slots = { cpu = 2, gpu = 2 }/' "$T/beta.toml"; kill9 beta; start_agent beta; sleep 3
+b1=$(submit fake --host beta --needs gpu --prio 100 -e FAKE_SLEEP=0.3 -e FAKE_TERM_IGNORE=1 -- 60)
+b2=$(submit fake --host beta --needs gpu --prio 100 -e FAKE_SLEEP=0.3 -e FAKE_TERM_IGNORE=1 -- 60)
+done_ge "$b1" 2 30; done_ge "$b2" 2 30
+u1=$(submit fake --host beta --needs gpu --prio 0 -e FAKE_SLEEP=0.2 -- 6); u2=$(submit fake --host beta --needs gpu --prio 0 -e FAKE_SLEEP=0.2 -- 6); sleep 3
+check "one bump in flight per resource" eq "$(g ls --json | jq "[.items[]|select(.host==\"beta\" and .state==\"stopping\")]|length")" 1
+state "$u1" needs-you 60 >/dev/null; state "$u2" needs-you 60 >/dev/null; g ack "$u1" "$u2" >/dev/null
+g cancel "$b1" "$b2" >/dev/null
 
 echo
 g ls | head -12

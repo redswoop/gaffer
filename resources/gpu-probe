@@ -1,0 +1,11 @@
+#!/bin/bash
+# gaffer resource probe for an NVIDIA GPU ([agent.resources.gpu] probe = ".../resources/gpu-probe"):
+# first line `used=MiB total=MiB`, then one `PID NAME MiB` line per process on the card. The agent
+# attributes pids to its own jobs and treats the rest as foreign (idle residents, or someone's work).
+set -u
+read -r used total < <(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits | head -1 | tr -d ',')
+echo "used=${used:-0} total=${total:-0}"
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null |
+  while IFS=, read -r pid name mib; do
+    echo "$(echo "$pid" | tr -d ' ') $(basename "$(echo "$name" | tr -d ' ')") $(echo "$mib" | tr -d ' ')"
+  done

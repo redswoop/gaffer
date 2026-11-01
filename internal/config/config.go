@@ -22,14 +22,38 @@ type Config struct {
 	TokenFile  string `toml:"token_file"`
 	Ntfy       string `toml:"ntfy"`  // full topic URL; empty = no pushes
 	Kinds      Dirs   `toml:"kinds"` // one dir or a list; a kind's name resolves to the first dir that has it
+	// PreemptGap: a queued job bumps a running one off a full slot when its priority number is lower by at
+	// least this much (default 50; negative turns job-vs-job preemption off). Leases always bump.
+	PreemptGap int `toml:"preempt_gap"`
 	Agent      struct {
-		Host    string         `toml:"host"`
-		Dir     string         `toml:"dir"`
-		Slots   map[string]int `toml:"slots"`
-		Path    Dirs           `toml:"path"` // put in front of PATH for everything the agent runs (a unit's PATH is bare)
-		Observe []Observer     `toml:"observe"`
+		Host      string              `toml:"host"`
+		Dir       string              `toml:"dir"`
+		Slots     map[string]int      `toml:"slots"`
+		Path      Dirs                `toml:"path"` // put in front of PATH for everything the agent runs (a unit's PATH is bare)
+		Observe   []Observer          `toml:"observe"`
+		Resources map[string]Resource `toml:"resources"` // per slot label: how to see who has it and how to clear idle residents
 	} `toml:"agent"`
 	Token string `toml:"-"`
+}
+
+// Resource is the agent's hooks for one slot label (gpu, say). `probe` prints `used=N total=M` and then one
+// `PID NAME AMOUNT` line per process using it; `release` is run before a job takes the resource when nothing
+// holds a lease on it and the probe still shows more than idle_mib in foreign use (cached models, an
+// idle chat server): it gets GAFFER_RES, GAFFER_HOLDERS (lease holders, holder:class, comma-separated)
+// and, when run for `gaffer lease --wait`, GAFFER_WAITING_FOR (that holder).
+type Resource struct {
+	Probe   string `toml:"probe"`
+	Release string `toml:"release"`
+	IdleMiB int    `toml:"idle_mib"` // foreign use at or below this is nothing to clear (default 0)
+	Every   int    `toml:"every"`    // probe period, seconds (default 10)
+}
+
+// Gap is the effective preemption gap: 0 in the file means the default, negative means off.
+func (c *Config) Gap() int {
+	if c.PreemptGap == 0 {
+		return 50
+	}
+	return c.PreemptGap
 }
 
 // Dirs takes `kinds = "/a"` as well as `kinds = ["/a", "/b"]`.
@@ -147,6 +171,8 @@ type Kind struct {
 	Env           map[string]string `toml:"env"`
 	OnInterrupt   string            `toml:"on_interrupt"`
 	Needs         string            `toml:"needs"`
+	Shares        []string          `toml:"shares"`   // lease classes this kind's steps co-exist with (a step may override)
+	Priority      int               `toml:"priority"` // default --prio for this kind (0 = 100)
 	StopGrace     int               `toml:"stop_grace"`
 	StallAfter    int               `toml:"stall_after"`
 	ProgressRegex string            `toml:"progress_regex"`
@@ -199,7 +225,7 @@ func (k *Kind) Spec(name string, args []string) proto.Spec {
 		title = strings.ReplaceAll(title, fmt.Sprintf("{{%d}}", i), v)
 	}
 	return proto.Spec{Kind: name, Title: strings.TrimSpace(title), Args: args, Env: k.Env, Steps: k.Steps,
-		OnInterrupt: k.OnInterrupt, Needs: k.Needs, StopGrace: k.StopGrace, StallAfter: k.StallAfter,
+		OnInterrupt: k.OnInterrupt, Needs: k.Needs, Shares: k.Shares, Priority: k.Priority, StopGrace: k.StopGrace, StallAfter: k.StallAfter,
 		ProgressRegex: k.ProgressRegex, ProgressPoll: k.ProgressPoll, PollEvery: k.PollEvery, Fits: k.Fits,
 		Review: k.Review, Quiet: k.Quiet, Actions: k.Actions, MaxRetries: k.MaxRetries}
 }

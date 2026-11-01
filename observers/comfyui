@@ -5,5 +5,7 @@ set -uo pipefail
 q=$(curl -fsS -m 5 "${COMFY_URL:-http://127.0.0.1:8188}/queue") || exit 0
 r=$(jq '.queue_running | length' <<<"$q") p=$(jq '.queue_pending | length' <<<"$q")
 [ $((r + p)) -gt 0 ] || exit 0
+# work in the queue keeps Comfy's gpu lease fresh (the prompt hook took it; a long batch outlives one TTL)
+gaffer lease gpu --holder comfy --class comfy --ttl 10m >/dev/null 2>&1 || true
 echo "::item queue title=\"ComfyUI queue\" kind=comfyui state=running"
 echo "::msg $r running, $p pending"

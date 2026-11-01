@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // A process is identified by boot id + pid + kernel start time, so neither a reboot nor pid reuse
@@ -46,6 +47,16 @@ func selfIdent() ident {
 	_, st, _ := procStat(os.Getpid())
 	return ident{PID: os.Getpid(), Boot: bootID(), Start: st}
 }
+
+// SelfIdent is this process's identity, for `gaffer lease -- CMD` to hand the agent.
+func SelfIdent() (pid int, boot string, start uint64) {
+	id := selfIdent()
+	return id.PID, id.Boot, id.Start
+}
+
+func unmarshal(b []byte, v any) error { return json.Unmarshal(b, v) }
+
+func clock(ms int64) string { return time.UnixMilli(ms).Format("15:04") }
 
 // alive: same boot, same process (start time matches), not a zombie.
 func (id ident) alive() bool {

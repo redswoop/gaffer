@@ -79,7 +79,7 @@ func render(w io.Writer, st proto.Status, s style) {
 	header(w, st, s)
 	secs := []*section{
 		{name: "NEEDS YOU", paint: s.yellow}, {name: "FAILED", paint: s.red}, {name: "RUNNING", paint: s.green},
-		{name: "QUEUED", paint: s.bold}, {name: "PAUSED / HELD", paint: s.bold}, {name: "RECENT", paint: s.dim},
+		{name: "YIELDED", paint: s.yellow}, {name: "QUEUED", paint: s.bold}, {name: "PAUSED / HELD", paint: s.bold}, {name: "RECENT", paint: s.dim},
 	}
 	var history []proto.Item
 	for _, it := range st.Items {
@@ -90,17 +90,19 @@ func render(w io.Writer, st proto.Status, s style) {
 			secs[1].items = append(secs[1].items, it)
 		case active(it.State):
 			secs[2].items = append(secs[2].items, it)
-		case it.State == proto.SQueued:
+		case it.State == proto.SYielded:
 			secs[3].items = append(secs[3].items, it)
-		case it.State == proto.SPaused || it.State == proto.SHeld:
+		case it.State == proto.SQueued:
 			secs[4].items = append(secs[4].items, it)
+		case it.State == proto.SPaused || it.State == proto.SHeld:
+			secs[5].items = append(secs[5].items, it)
 		default:
 			history = append(history, it)
 		}
 	}
 	sort.SliceStable(history, func(a, b int) bool { return history[a].Finished > history[b].Finished })
 	if s.all {
-		secs[5].items = history
+		secs[6].items = history
 	}
 	// one set of column widths for the whole board, so sections line up
 	idW, kindW, hostW, titleW := 2, 0, 0, 0
@@ -174,16 +176,48 @@ func header(w io.Writer, st proto.Status, s style) {
 			labels = append(labels, l)
 		}
 		sort.Strings(labels)
+		byRes := map[string][]proto.Lease{}
+		for _, l := range h.Leases {
+			byRes[l.Res] = append(byRes[l.Res], l)
+		}
 		slots := []string{}
 		for _, l := range labels {
-			slots = append(slots, fmt.Sprintf("%s %d/%d", l, h.Used[l], h.Slots[l]))
+			slot := fmt.Sprintf("%s %d/%d", l, h.Used[l], h.Slots[l])
+			// who has it, when it isn't just jobs: lease holders, then whatever foreign thing the probe sees
+			var who []string
+			for _, ls := range byRes[l] {
+				w := ls.Holder
+				if ls.Class != "" && ls.Class != ls.Holder {
+					w += " " + ls.Class
+				}
+				if ls.Exclusive {
+					w += " excl"
+				}
+				who = append(who, w)
+			}
+			if r, ok := h.Resources[l]; ok {
+				for _, hd := range r.Holders {
+					if !strings.HasPrefix(hd, "#") && !strings.Contains(hd, "(") && len(byRes[l]) == 0 {
+						who = append(who, hd) // a foreign process on an unleased resource
+					}
+				}
+				if len(who) > 0 && r.Idle > 0 {
+					who[len(who)-1] += ", idle " + fmtDur(float64(r.Idle)/1000)
+				}
+			}
+			if len(who) > 0 {
+				slot += s.yellow(" ("+strings.Join(who, ", ")+")")
+			}
+			slots = append(slots, slot)
 		}
 		desc := h.Host + " " + s.dim(strings.Join(slots, " "))
 		switch {
 		case !h.Online:
 			bad = append(bad, s.red(fmt.Sprintf("%s OFFLINE %s", h.Host, fmtDur(float64(st.Now-h.Seen)/1000))))
+		case h.Held && strings.HasPrefix(h.Note, "pausing everything"):
+			bad = append(bad, s.yellow(h.Host+" HELD: "+h.Note))
 		case h.Held:
-			bad = append(bad, s.yellow(h.Host+" HELD: "+h.Note)+" "+s.dim("(gaffer release "+h.Host+")"))
+			bad = append(bad, s.yellow(h.Host+" HELD: "+h.Note)+" "+s.dim("(gaffer host release "+h.Host+")"))
 		default:
 			ok = append(ok, desc)
 		}
@@ -232,12 +266,51 @@ func detail(it proto.Item, w int, cols progCols, s style) string {
 			hint = fmt.Sprintf("  → gaffer ack %d", it.ID) // the source owns retries
 		}
 		return s.red(cut(it.Reason, max(10, w-runes(hint)))) + s.dim(hint)
+	case it.State == proto.SAssigned:
+		return s.dim("starting…")
+	case it.State == proto.SStopping:
+		how := it.StopMode
+		if how == "yield" && it.YieldTo != "" {
+			how = "yielding to " + it.YieldTo
+		}
+		if how == "" { // the agent's own doing: the shutdown hook, a lease
+			return s.dim(strings.Replace(it.Reason, "stopping (", "stopping… (", 1))
+		}
+		return s.dim("stopping… (" + how + ")")
 	case active(it.State):
 		return progressDetail(it, w, cols, s)
-	case it.State == proto.SQueued, it.State == proto.SPaused, it.State == proto.SHeld:
+	case it.State == proto.SYielded:
+		at := ""
+		if it.Progress != nil && it.Progress.Total > 0 {
+			at = fmt.Sprintf(" at %.0f%%", 100*it.Progress.Done/it.Progress.Total)
+		}
+		back := "resumes when idle"
+		if strings.HasPrefix(it.YieldTo, "#") {
+			back = "resumes when it's done"
+		}
+		since := ""
+		if it.YieldedAt > 0 {
+			since = " " + fmtDur(float64(time.Now().UnixMilli()-it.YieldedAt)/1000)
+		}
+		return s.yellow(cut("to "+it.YieldTo+since+at, max(10, w-len(back)-3))) + s.dim(" · "+back)
+	case it.State == proto.SPaused:
+		at := ""
+		if it.Progress != nil && it.Progress.Total > 0 {
+			at = fmt.Sprintf(" at %.0f%%", 100*it.Progress.Done/it.Progress.Total)
+		}
+		if it.PausedBy == "shutdown" {
+			return s.dim(cut("for a shutdown"+at+" · resumes when "+it.Host+" is back", w))
+		}
+		hint := fmt.Sprintf("  → gaffer resume %d", it.ID)
+		return s.dim(cut("by you"+at, max(10, w-runes(hint))) + hint)
+	case it.State == proto.SQueued, it.State == proto.SHeld:
 		r := it.Reason
 		if r == "" && it.Progress != nil && it.Progress.Total > 0 {
 			r = fmt.Sprintf("at %.0f%%", 100*it.Progress.Done/it.Progress.Total)
+		}
+		if it.State == proto.SHeld {
+			hint := fmt.Sprintf("  → gaffer resume %d", it.ID)
+			return s.dim(cut(r, max(10, w-runes(hint))) + hint)
 		}
 		return s.dim(cut(r, w))
 	}

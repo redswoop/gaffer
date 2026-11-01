@@ -1,4 +1,5 @@
 #!/bin/bash
 # fits: not now while $FAKE_NOFIT exists (stands in for "VRAM busy", "lease held").
+[ -n "${FAKE_FITS_SLEEP:-}" ] && sleep "$FAKE_FITS_SLEEP"   # a slow check, to land a lease in the middle of
 if [ -n "${FAKE_NOFIT:-}" ] && [ -e "$FAKE_NOFIT" ]; then echo "blocked by $(basename "$FAKE_NOFIT")"; exit 1; fi
 exit 0

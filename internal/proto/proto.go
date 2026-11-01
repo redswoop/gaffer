@@ -5,12 +5,13 @@ package proto
 // picks up at the next step without asking the kind; resuming inside a step is the kind's business
 // (::checkpoint + W_RESUME).
 type Step struct {
-	Name  string `json:"name" toml:"name"`
-	Run   string `json:"run" toml:"run"`
-	Needs string `json:"needs,omitempty" toml:"needs"` // this step's slot label; "" = the kind's
+	Name   string   `json:"name" toml:"name"`
+	Run    string   `json:"run" toml:"run"`
+	Needs  string   `json:"needs,omitempty" toml:"needs"`   // this step's slot label; "" = the kind's
+	Shares []string `json:"shares,omitempty" toml:"shares"` // lease classes this step co-exists with; "" = the kind's
 }
 
-// Needs is the slot label the job occupies while on step i: the step's own, else the kind's, else cpu.
+// NeedsAt is the slot label the job occupies while on step i: the step's own, else the kind's, else cpu.
 func (s Spec) NeedsAt(i int) string {
 	if i >= 0 && i < len(s.Steps) && s.Steps[i].Needs != "" {
 		return s.Steps[i].Needs
@@ -19,6 +20,33 @@ func (s Spec) NeedsAt(i int) string {
 		return "cpu"
 	}
 	return s.Needs
+}
+
+// SharesAt is the lease classes step i can run alongside (a job that uses the local LLM shares "llm":
+// a Qwen lease neither bumps it nor waits for it): the step's own, else the kind's.
+func (s Spec) SharesAt(i int) []string {
+	if i >= 0 && i < len(s.Steps) && len(s.Steps[i].Shares) > 0 {
+		return s.Steps[i].Shares
+	}
+	return s.Shares
+}
+
+// SharesAll: every one of the given lease classes is shared by step i.
+func (s Spec) SharesAll(i int, classes []string) bool {
+	sh := s.SharesAt(i)
+	for _, c := range classes {
+		found := false
+		for _, x := range sh {
+			if x == c {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // Spec is everything an agent needs to run a job. It is resolved from the kind manifest at submit
@@ -32,6 +60,8 @@ type Spec struct {
 	Steps         []Step            `json:"steps"`
 	OnInterrupt   string            `json:"on_interrupt,omitempty"` // resume (default) | restart | hold
 	Needs         string            `json:"needs,omitempty"`        // slot label; "" = cpu; a step may override (NeedsAt)
+	Shares        []string          `json:"shares,omitempty"`       // lease classes the job co-exists with (SharesAt)
+	Priority      int               `json:"priority,omitempty"`     // the kind's default --prio (0 = 100)
 	Host          string            `json:"host,omitempty"`         // pin to one agent
 	StopGrace     int               `json:"stop_grace,omitempty"`   // seconds between TERM and KILL
 	StallAfter    int               `json:"stall_after,omitempty"`  // seconds without progress -> stalled
@@ -77,7 +107,56 @@ type Assign struct {
 
 type Stop struct {
 	ID   int64  `json:"id"`
-	Mode string `json:"mode"` // pause | cancel
+	Mode string `json:"mode"`          // pause | cancel | yield
+	Res  string `json:"res,omitempty"` // yield: the resource wanted; ignored if the job's step no longer needs it
+	For  int64  `json:"for,omitempty"` // yield: the item it yields to
+}
+
+// Lease is a holder of a resource on a host that isn't a job step: an interactive user (a chat model,
+// a render UI) with a TTL it refreshes while active, or a process (a game) that holds it while it lives.
+// The agent owns leases; the controller only sees them in reports.
+type Lease struct {
+	Res       string `json:"res"`
+	Holder    string `json:"holder"`
+	Class     string `json:"class"`               // what kind of use: jobs whose step `shares` it are not bumped
+	Exclusive bool   `json:"exclusive,omitempty"` // refuses every other lease (and every job)
+	Since     int64  `json:"since"`
+	Refreshed int64  `json:"refreshed"`
+	Expires   int64  `json:"expires,omitempty"` // 0: process-bound
+	PID       int    `json:"pid,omitempty"`
+	Job       int64  `json:"job,omitempty"` // taken from inside this job: it is a co-holder, never bumped
+}
+
+// LeaseReq / LeaseResp are `gaffer lease` talking to the local agent over its unix socket.
+type LeaseReq struct {
+	Res       string `json:"res"`
+	Holder    string `json:"holder"`
+	Class     string `json:"class"`
+	Exclusive bool   `json:"exclusive,omitempty"`
+	TTLMS     int64  `json:"ttl_ms,omitempty"` // 0: process-bound (PID/Boot/Start identify the holder)
+	PID       int    `json:"pid,omitempty"`
+	Boot      string `json:"boot,omitempty"`
+	Start     uint64 `json:"start,omitempty"`
+	Scope     string `json:"scope,omitempty"` // the holder's systemd scope, if it runs in one: the lease lives while it is active
+	Job       int64  `json:"job,omitempty"`   // W_ID of the job asking: that job is a co-holder
+}
+
+type LeaseResp struct {
+	State   string   `json:"state"` // granted | refreshed | refused | gone
+	Reason  string   `json:"reason,omitempty"`
+	Lease   *Lease   `json:"lease,omitempty"`
+	Ready   bool     `json:"ready"`             // nothing else of gaffer's is on the resource (and the probe agrees)
+	Pending []string `json:"pending,omitempty"` // what is still on it
+	Bumping []int64  `json:"bumping,omitempty"` // jobs told to step aside by this grant
+}
+
+// ResourceReport is what the agent's probe hook says about a resource (used by the board header and by
+// `gaffer lease --wait`): how much is in use, since when it last changed, and who the holders are.
+type ResourceReport struct {
+	Used    int      `json:"used"`              // MiB (or whatever the probe counts)
+	Total   int      `json:"total"`
+	Idle    int64    `json:"idle"`              // ms since `used` last moved
+	Holders []string `json:"holders,omitempty"` // leases, then jobs (#id), then foreign process names
 }
 
 // Agent-side job states.
@@ -107,6 +186,9 @@ type JobReport struct {
 	LogSize    int64       `json:"log_size"`
 	Started    int64       `json:"started,omitempty"`
 	Finished   int64       `json:"finished,omitempty"`
+	StopMode   string      `json:"stop_mode,omitempty"` // pause | cancel | yield: what the agent was doing when it stopped
+	StopBy     string      `json:"stop_by,omitempty"`   // "" (the controller asked) | shutdown | lease:HOLDER | #ID
+	StopBoot   string      `json:"stop_boot,omitempty"` // the boot the stop happened in
 }
 
 type LogChunk struct {
@@ -124,6 +206,10 @@ type SyncReq struct {
 	Logs    []LogChunk     `json:"logs,omitempty"`
 	// the observers this agent runs; one it no longer runs is retired. nil (an older agent): no pruning.
 	Observers []string `json:"observers"`
+	Hold      string   `json:"hold,omitempty"` // "shutdown" while the host is pausing everything: hand it nothing
+	// the leases held on this host right now; nil (an older agent): unknown, [] : none
+	Leases    []Lease                   `json:"leases"`
+	Resources map[string]ResourceReport `json:"resources,omitempty"`
 }
 
 type SyncResp struct {
@@ -151,6 +237,11 @@ type Item struct {
 	StepName   string      `json:"step_name,omitempty"`
 	Priority   int         `json:"priority"`
 	Reason     string      `json:"reason,omitempty"`
+	PausedBy   string      `json:"paused_by,omitempty"` // human | shutdown | yield: who stopped it, so who restarts it
+	StopMode   string      `json:"stop_mode,omitempty"` // while stopping: pause | cancel | yield
+	YieldTo    string      `json:"yield_to,omitempty"`  // yielded: "qwen (llm)" or "#321"
+	YieldedAt  int64       `json:"yielded_at,omitempty"`
+	RunMS      int64       `json:"run_ms,omitempty"` // time actually spent running, over every attempt
 	Attention  string      `json:"attention,omitempty"`
 	Observed   bool        `json:"observed,omitempty"`
 	Source     string      `json:"source,omitempty"` // the observer that reports it (observed items only)
@@ -180,6 +271,7 @@ const (
 	SRunning  = "running"
 	SStopping = "stopping"
 	SPaused   = "paused"
+	SYielded  = "yielded" // stepped aside for a lease or a more urgent job; comes back by itself
 	SNeedsYou = "needs-you"
 	SDone     = "done"
 	SFailed   = "failed"
@@ -194,9 +286,11 @@ type Host struct {
 	Used     map[string]int `json:"used"`
 	Seen     int64          `json:"seen"`
 	Online   bool           `json:"online"`
-	Held     bool           `json:"held"` // takes no new work (by hand, the breaker, or a shutdown in progress)
+	Held     bool           `json:"held"` // takes no new work: by hand, the breaker, or while it pauses everything for a shutdown
 	Note     string         `json:"note,omitempty"`
 	Failures int            `json:"failures"`
+	Leases   []Lease        `json:"leases,omitempty"`
+	Resources map[string]ResourceReport `json:"resources,omitempty"`
 }
 
 // ObserveReq is one run of an observer: on success Out is the full snapshot of its source.

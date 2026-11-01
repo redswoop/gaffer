@@ -10,14 +10,16 @@
 #   REMOTES="boxb boxc"            # ssh-reachable agent hosts; they only need to reach us over HTTP
 #   REMOTE_DATA=/srv/gaffer        # data dir on the remotes (default: same as DATA)
 #   REMOTE_SLOTS='{ cpu = 4 }'
+#   REMOTE_CONF_EXTRA='[agent.resources.gpu] ...'   # appended verbatim to each remote's config.toml (resource hooks)
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 [ -f deploy.local ] && . ./deploy.local
 DATA=${DATA:-$HOME/.local/share/gaffer}; SLOTS=${SLOTS:-'{ cpu = 4 }'}; NTFY=${NTFY:-}
-REMOTES=${REMOTES:-}; REMOTE_DATA=${REMOTE_DATA:-$DATA}; REMOTE_SLOTS=${REMOTE_SLOTS:-'{ cpu = 4 }'}
+REMOTES=${REMOTES:-}; REMOTE_DATA=${REMOTE_DATA:-$DATA}; REMOTE_SLOTS=${REMOTE_SLOTS:-'{ cpu = 4 }'}; REMOTE_CONF_EXTRA=${REMOTE_CONF_EXTRA:-}
 HOST=$(hostname -s | tr '[:upper:]' '[:lower:]')
 
-CGO_ENABLED=0 go build -o gaffer .
+VERSION=$(git describe --always --dirty --tags 2>/dev/null || echo dev)
+CGO_ENABLED=0 go build -ldflags "-X gaffer/internal/agent.Version=$VERSION" -o gaffer .
 IP=$(tailscale ip -4 2>/dev/null | head -1 || true); IP=${IP:-127.0.0.1}
 mkdir -p ~/.local/bin ~/.config/gaffer ~/.config/systemd/user
 \cp -f gaffer ~/.local/bin/gaffer.new && mv -f ~/.local/bin/gaffer.new ~/.local/bin/gaffer   # rename: running shims keep their inode
@@ -54,6 +56,7 @@ for R in $REMOTES; do
     RK="$RK${RK:+, }\"$D/kinds/$i\""
   done
   ssh "$R" "cd $D/kinds && for e in *; do case \$e in *[!0-9]*) rm -rf -- \"\$e\";; *) [ \"\$e\" -lt ${#KDIRS[@]} ] || rm -rf -- \"\$e\";; esac; done"
+  rsync -a --delete resources/ "$R:$D/resources/"   # the resource probes ([agent.resources.*] probe = "$D/resources/gpu-probe")
   ssh "$R" "cat > ~/.config/gaffer/config.toml" <<EOT
 controller = "http://$IP:8097"
 data = "$D"
@@ -62,6 +65,7 @@ kinds = [$RK]
 host = "$R"
 dir = "$D/agent"
 slots = $REMOTE_SLOTS
+$REMOTE_CONF_EXTRA
 EOT
   ssh "$R" "umask 077; cat > ~/.config/gaffer/token" < ~/.config/gaffer/token
   rsync -a deploy/gaffer-agent.service deploy/gaffer-shutdown.service "$R:.config/systemd/user/"
@@ -71,4 +75,4 @@ EOT
     systemctl --user daemon-reload && systemctl --user enable gaffer-agent.service gaffer-shutdown.service >/dev/null 2>&1
     systemctl --user restart gaffer-agent.service && systemctl --user start gaffer-shutdown.service"
 done
-echo "deployed $(git rev-parse --short HEAD 2>/dev/null || echo uncommitted): controller http://$IP:8097, agents $HOST $REMOTES"
+echo "deployed $VERSION: controller http://$IP:8097, agents $HOST $REMOTES  (gaffer ls --json | jq '.hosts[]|.host+\" \"+.version' shows what each runs)"

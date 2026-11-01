@@ -1,6 +1,10 @@
 // Package agent runs jobs on one host. It owns the processes and the job directories; the controller
 // only ever sees reports. Everything an agent knows is on disk, so killing it (or the controller, or
 // the network) at any moment loses nothing: on restart it re-reads the job dirs and reconciles.
+//
+// The agent is single-threaded by design: one loop owns every job and lease, and anything that happens
+// elsewhere (a sync reply, a probe result, a `gaffer lease` request on the socket) is handed to that loop
+// as a closure on `ops`. Nothing in here takes a lock.
 package agent
 
 import (
@@ -24,7 +28,8 @@ import (
 	"gaffer/internal/proto"
 )
 
-const Version = "0.1.0"
+// Version is set by the build (-ldflags "-X gaffer/internal/agent.Version=...", see deploy.sh).
+var Version = "dev"
 
 type pollResult struct {
 	id      int64
@@ -42,11 +47,16 @@ type Agent struct {
 	polls   chan pollResult
 	client  *http.Client
 	synced  bool
+	syncing bool // a sync is in flight (it runs off the loop; a dead network must not stall leases)
 	obsLast map[string]int64
 	obsBusy map[string]bool
 	obsDone chan string
 	lock    *os.File // agent.lock, held for the agent's whole life (see Run)
 	scopes  bool     // steps run in transient systemd scopes (own cgroup each): an OOM kill takes one job, not the agent
+	ops     chan func()
+	hold    string             // "shutdown" while pause-all is in effect: the controller hands us nothing
+	leases  map[string]*lease  // res/holder -> lease (see lease.go)
+	res     map[string]*probed // slot label -> last probe (see resource.go)
 }
 
 func now() int64 { return time.Now().UnixMilli() }
@@ -54,7 +64,8 @@ func now() int64 { return time.Now().UnixMilli() }
 func Run(cfg *config.Config) error {
 	a := &Agent{cfg: cfg, host: cfg.Agent.Host, dir: cfg.Agent.Dir, jobs: map[int64]*job{}, logHave: map[int64]int64{},
 		polls: make(chan pollResult, 16), client: &http.Client{Timeout: 15 * time.Second},
-		obsLast: map[string]int64{}, obsBusy: map[string]bool{}, obsDone: make(chan string, 16)}
+		obsLast: map[string]int64{}, obsBusy: map[string]bool{}, obsDone: make(chan string, 16),
+		ops: make(chan func(), 64), leases: map[string]*lease{}, res: map[string]*probed{}}
 	a.exe, _ = os.Executable()
 	if len(cfg.Agent.Path) > 0 {
 		os.Setenv("PATH", strings.Join(cfg.Agent.Path, ":")+":"+os.Getenv("PATH"))
@@ -77,13 +88,27 @@ func Run(cfg *config.Config) error {
 			a.jobs[j.ID] = j
 		}
 	}
-	log.Printf("agent %s up (boot %.8s), %d job dirs, controller %s, steps in %s", a.host, bootID(), len(a.jobs), cfg.Controller,
-		map[bool]string{true: "systemd scopes", false: "plain sessions (no systemd-run --user)"}[a.scopes])
+	a.loadLeases()
+	if err := a.listen(); err != nil {
+		return err
+	}
+	log.Printf("agent %s up (boot %.8s), %d job dirs, %d leases, controller %s, steps in %s", a.host, bootID(), len(a.jobs), len(a.leases),
+		cfg.Controller, map[bool]string{true: "systemd scopes", false: "plain sessions (no systemd-run --user)"}[a.scopes])
 	os.Remove(a.pauseAllPath()) // a request from before a restart or reboot is void: nothing of that is running
 	lastSync := int64(0)
+	next := time.After(0)
 	for {
+		select {
+		case f := <-a.ops:
+			f()
+			continue
+		case <-next:
+		}
+		next = time.After(time.Second)
 		t := now()
 		a.pauseAll(t)
+		a.enforceLeases(t)
+		a.probe(t)
 		a.drainPolls(t)
 		a.observe(t)
 		for _, j := range a.jobs {
@@ -92,13 +117,21 @@ func Run(cfg *config.Config) error {
 				j.save()
 			}
 		}
-		if t-lastSync >= 2000 {
-			lastSync = t
-			if err := a.sync(); err != nil {
-				log.Printf("sync: %v", err)
-			}
+		if t-lastSync >= 2000 && !a.syncing {
+			lastSync, a.syncing = t, true
+			req := a.buildSync()
+			go func() {
+				resp, err := a.postSync(req)
+				a.ops <- func() {
+					a.syncing = false
+					if err != nil {
+						log.Printf("sync: %v", err)
+						return
+					}
+					a.applySync(resp)
+				}
+			}()
 		}
-		time.Sleep(time.Second)
 	}
 }
 
@@ -220,25 +253,34 @@ func (a *Agent) stepFinished(j *job, rc int, sig string, t int64) {
 // pauseAll: `gaffer shutdown` (the OS shutdown hook) asks for every running job to pause by dropping a
 // file in the agent dir: no controller, no network, which are both going away at that moment. The
 // pauses are recorded on disk like any other and reported when the controller is next reachable, after
-// the reboot if need be. A request older than two minutes is stale (the hook died) and ignored.
+// the reboot if need be, as "paused for a shutdown": they come back by themselves once the host does.
+// While the file is there the host reports itself held. A request older than two minutes is stale (the
+// hook died) and ignored.
 func (a *Agent) pauseAllPath() string { return filepath.Join(a.dir, "pause-all") }
 
 func (a *Agent) pauseAll(t int64) {
 	st, err := os.Stat(a.pauseAllPath())
-	if err != nil {
+	if err != nil || t-st.ModTime().UnixMilli() > 120000 {
+		if err == nil {
+			os.Remove(a.pauseAllPath())
+		}
+		a.hold = ""
 		return
 	}
-	if t-st.ModTime().UnixMilli() > 120000 {
-		os.Remove(a.pauseAllPath())
-		return
-	}
+	a.hold = "shutdown"
 	for _, j := range a.jobs {
 		if j.State == proto.JRunning && j.StopMode == "" && j.Spec.OnInterrupt != "hold" { // actions (hold) run to the end or get held
-			j.StopMode, j.StopAt = "pause", t
-			j.save()
+			a.stop(j, "pause", "shutdown", "", t)
 			log.Printf("#%d: pause requested (shutdown)", j.ID)
 		}
 	}
+}
+
+// stop asks a running job to stop: the next tick sends TERM, then KILL after the grace. `by` says who
+// wanted it when it wasn't the controller: "shutdown", "lease:HOLDER", "#ID".
+func (a *Agent) stop(j *job, mode, by, res string, t int64) {
+	j.StopMode, j.StopBy, j.StopRes, j.StopAt, j.StopBoot = mode, by, res, t, bootID()
+	j.save()
 }
 
 func (a *Agent) end(j *job, state, reason string, t int64) {
@@ -274,8 +316,10 @@ func (a *Agent) spawn(j *job, t int64) {
 func (a *Agent) start(as proto.Assign) {
 	t := now()
 	j := a.jobs[as.ID]
-	if j != nil && (j.State == proto.JRunning || (j.Attempt >= as.Attempt && !(j.State == proto.JRejected && j.Acked))) {
-		return // already on it, or a stale re-send (a fits rejection the controller has taken back doesn't count as an attempt)
+	// already on it, or a stale re-send. An acked final attempt may be followed by a lower number (a retry
+	// resets the count); a rejected one by the same number (a fits "not now" wasn't an attempt).
+	if j != nil && (j.State == proto.JRunning || (j.Attempt >= as.Attempt && !j.Acked)) {
+		return
 	}
 	dir := filepath.Join(a.dir, "jobs", strconv.FormatInt(as.ID, 10))
 	if j == nil {
@@ -286,7 +330,7 @@ func (a *Agent) start(as proto.Assign) {
 	j.Attempt, j.Spec, j.Host, j.State, j.Step = as.Attempt, as.Spec, a.host, proto.JRunning, as.Step
 	j.KindDir = a.cfg.KindDir(as.Spec.Kind)
 	j.Resume, j.ResumeStep = as.Resume, as.Step
-	j.StopMode, j.StopAt, j.RC, j.Reason, j.Started, j.Finished, j.Acked = "", 0, 0, "", t, 0, false
+	j.StopMode, j.StopBy, j.StopRes, j.StopBoot, j.StopAt, j.RC, j.Reason, j.Started, j.Finished, j.Acked = "", "", "", "", 0, 0, "", t, 0, false
 	j.P.Attention = ""
 	os.MkdirAll(filepath.Join(dir, "state"), 0o755)
 	if as.Resume {
@@ -306,12 +350,27 @@ func (a *Agent) start(as proto.Assign) {
 	} else if as.Step > 0 {
 		how = "from step " + j.Spec.Steps[as.Step].Name
 	}
+	n := j.Spec.NeedsAt(j.Step)
+	// A lease on the resource this step needs, that the step doesn't share: not now (not an attempt).
+	if l := a.blockingLease(n, j.Spec, j.Step, j.ID); l != nil {
+		a.end(j, proto.JRejected, n+" leased to "+l.text(), t)
+		return
+	}
+	// Idle residents (cached models, an idle chat server) still on the resource with nobody leasing it:
+	// the host's release hook clears them before the kind's fits looks.
+	if n != "cpu" {
+		a.releaseIdle(n, "", j.Spec.SharesAt(j.Step), t)
+	}
 	// fits guards a resource (VRAM, a lease): it runs before a step that needs a slot beyond the default
 	// cpu, and before the banner, so a "not now" leaves no trace in the job's log.
-	if j.Spec.Fits != "" && j.Spec.NeedsAt(j.Step) != "cpu" {
+	if j.Spec.Fits != "" && n != "cpu" {
 		if out, ok := a.runAux(j, j.Spec.Fits, 60*time.Second); !ok {
 			lines := strings.Split(strings.TrimSpace(out), "\n")
 			a.end(j, proto.JRejected, trunc(lines[len(lines)-1], 200), t)
+			return
+		}
+		if l := a.blockingLease(n, j.Spec, j.Step, j.ID); l != nil { // one landed while fits ran
+			a.end(j, proto.JRejected, n+" leased to "+l.text(), t)
 			return
 		}
 	}
@@ -418,9 +477,10 @@ func (a *Agent) observe(t int64) {
 	}
 }
 
-func (a *Agent) sync() error {
+// buildSync is the agent's whole truth, assembled on the loop; postSync ships it off the loop.
+func (a *Agent) buildSync() proto.SyncReq {
 	req := proto.SyncReq{Host: a.host, BootID: bootID(), Version: Version, Slots: a.cfg.Agent.Slots, Jobs: []proto.JobReport{},
-		Observers: []string{}}
+		Observers: []string{}, Hold: a.hold, Leases: a.leaseList(), Resources: a.resourceReports()}
 	for _, o := range a.cfg.Agent.Observe {
 		req.Observers = append(req.Observers, o.Name)
 	}
@@ -442,22 +502,28 @@ func (a *Agent) sync() error {
 			}
 		}
 	}
+	return req
+}
+
+func (a *Agent) postSync(req proto.SyncReq) (proto.SyncResp, error) {
+	var resp proto.SyncResp
 	body, _ := json.Marshal(req)
 	hr, _ := http.NewRequest("POST", strings.TrimRight(a.cfg.Controller, "/")+"/api/agent/sync", bytes.NewReader(body))
 	hr.Header.Set("Authorization", "Bearer "+a.cfg.Token)
 	hr.Header.Set("Content-Type", "application/json")
 	res, err := a.client.Do(hr)
 	if err != nil {
-		return err
+		return resp, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return fmt.Errorf("controller: %s", res.Status)
+		return resp, fmt.Errorf("controller: %s", res.Status)
 	}
-	var resp proto.SyncResp
-	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
-		return err
-	}
+	return resp, json.NewDecoder(res.Body).Decode(&resp)
+}
+
+// applySync takes the controller's answer, on the loop: stops, acks, new work.
+func (a *Agent) applySync(resp proto.SyncResp) {
 	if !a.synced {
 		a.synced = true
 		log.Printf("synced with controller")
@@ -467,11 +533,20 @@ func (a *Agent) sync() error {
 		a.logHave[id] = h
 	}
 	for _, s := range resp.Stop {
-		if j := a.jobs[s.ID]; j != nil && j.State == proto.JRunning && j.StopMode == "" {
-			j.StopMode, j.StopAt = s.Mode, t
-			j.save()
-			log.Printf("#%d: %s requested", j.ID, s.Mode)
+		j := a.jobs[s.ID]
+		if j == nil || j.State != proto.JRunning || j.StopMode != "" {
+			continue
 		}
+		if s.Mode == "yield" && s.Res != "" && j.Spec.NeedsAt(j.Step) != s.Res {
+			log.Printf("#%d: yield of %s ignored: on step %s, which needs %s", j.ID, s.Res, j.Spec.Steps[j.Step].Name, j.Spec.NeedsAt(j.Step))
+			continue // the controller's view was a sync behind; it sees the step and takes it back
+		}
+		by := ""
+		if s.Mode == "yield" {
+			by = "#" + strconv.FormatInt(s.For, 10)
+		}
+		a.stop(j, s.Mode, by, s.Res, t)
+		log.Printf("#%d: %s requested%s", j.ID, s.Mode, map[bool]string{true: " for " + by, false: ""}[by != ""])
 	}
 	for _, ack := range resp.Ack {
 		if j := a.jobs[ack.ID]; j != nil && j.Attempt == ack.Attempt && j.State != proto.JRunning {
@@ -483,5 +558,4 @@ func (a *Agent) sync() error {
 	for _, as := range resp.Start {
 		a.start(as)
 	}
-	return nil
 }

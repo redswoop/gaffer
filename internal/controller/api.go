@@ -64,7 +64,11 @@ func (c *Controller) routes() http.Handler {
 			}
 			rows.Close()
 		}
-		reply(w, map[string]any{"item": c.derive(it, nowMS()), "events": evs})
+		var leases string
+		var ls []proto.Lease
+		c.db.QueryRow("SELECT leases FROM hosts WHERE host=?", it.Host).Scan(&leases)
+		json.Unmarshal([]byte(leases), &ls)
+		reply(w, map[string]any{"item": c.derive(it, nowMS()), "events": evs, "leases": ls})
 	})
 	m.HandleFunc("GET /api/items/{id}/log", func(w http.ResponseWriter, r *http.Request) {
 		id := pathID(r)
@@ -84,8 +88,14 @@ func (c *Controller) routes() http.Handler {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		h := r.PathValue("host")
+		var known int
+		c.db.QueryRow("SELECT COUNT(*) FROM hosts WHERE host=?", h).Scan(&known)
+		if known == 0 {
+			http.Error(w, "no such host "+h+" (no agent of that name has reported in)", 404)
+			return
+		}
 		switch r.PathValue("verb") {
-		case "hold": // takes no new work; running jobs are untouched (`gaffer drain` pauses them too, client side)
+		case "hold": // takes no new work; running jobs are untouched (`gaffer host drain` pauses them too, client side)
 			c.db.Exec("UPDATE hosts SET drained=1, note='held by hand' WHERE host=?", h)
 		case "release":
 			c.db.Exec("UPDATE hosts SET drained=0, failures=0, note='' WHERE host=?", h)
@@ -125,7 +135,7 @@ func pathID(r *http.Request) int64 {
 
 type submitReq struct {
 	Spec     proto.Spec `json:"spec"`
-	Priority int        `json:"priority"`
+	Priority *int       `json:"priority"`        // absent: the kind's default, else 100. 0 is 0.
 	Held     string     `json:"held,omitempty"` // non-empty: queue held with this reason
 }
 
@@ -135,15 +145,19 @@ func (c *Controller) submit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "need a spec with steps", 400)
 		return
 	}
-	if s.Priority == 0 {
-		s.Priority = 100
+	prio := 100
+	if s.Spec.Priority != 0 {
+		prio = s.Spec.Priority
+	}
+	if s.Priority != nil {
+		prio = *s.Priority
 	}
 	c.mu.Lock()
 	state := proto.SQueued
 	if s.Held != "" {
 		state = proto.SHeld
 	}
-	id := c.insert(s.Spec, state, s.Held, s.Priority, false)
+	id := c.insert(s.Spec, state, s.Held, prio, false)
 	c.mu.Unlock()
 	c.notify()
 	reply(w, map[string]int64{"id": id})
@@ -205,13 +219,17 @@ func (c *Controller) apply(it *rec, verb, body string) (string, error) {
 			return "", fmt.Errorf("#%d is an action; it runs to the end (cancel stops it)", it.ID)
 		}
 		switch it.State {
-		case proto.SQueued, proto.SHeld:
-			it.State = proto.SPaused
+		case proto.SQueued, proto.SHeld, proto.SYielded: // a yielded item paused by hand stays paused when the lease goes
+			it.State, it.PausedBy, it.YieldTo, it.YieldRes = proto.SPaused, "human", "", ""
+			it.Reason = "paused by you"
 		case proto.SAssigned, proto.SRunning, proto.SStopping:
 			if it.Observed {
 				return bad()
 			}
-			it.StopMode = "pause"
+			if it.StopMode == "cancel" {
+				return bad()
+			}
+			it.StopMode = "pause" // over a yield in flight too: a human's pause wins
 			if it.State != proto.SAssigned {
 				it.State = proto.SStopping
 			}
@@ -220,7 +238,7 @@ func (c *Controller) apply(it *rec, verb, body string) (string, error) {
 		}
 	case "cancel":
 		switch it.State {
-		case proto.SQueued, proto.SHeld, proto.SPaused, proto.SNeedsYou, proto.SFailed:
+		case proto.SQueued, proto.SHeld, proto.SPaused, proto.SYielded, proto.SNeedsYou, proto.SFailed:
 			it.State, it.Finished, it.Reason, it.Attention = proto.SCanceled, nowMS(), "canceled", ""
 		case proto.SAssigned, proto.SRunning, proto.SStopping:
 			if it.Observed {
@@ -234,16 +252,17 @@ func (c *Controller) apply(it *rec, verb, body string) (string, error) {
 		default:
 			return bad()
 		}
-	case "resume", "release":
-		if it.State != proto.SPaused && it.State != proto.SHeld {
+	case "resume": // a yielded item too: queued now, no debounce (it still waits for the lease to go unless it shares)
+		if it.State != proto.SPaused && it.State != proto.SHeld && it.State != proto.SYielded {
 			return bad()
 		}
-		it.State, it.Reason = proto.SQueued, ""
+		it.State, it.Reason, it.PausedBy, it.PausedBoot = proto.SQueued, "", "", ""
 	case "retry":
 		if it.State != proto.SFailed && it.State != proto.SCanceled && it.State != proto.SDone {
 			return bad()
 		}
-		it.State, it.Reason, it.Retries, it.Finished, it.Affinity, it.Acked = proto.SQueued, "", 0, 0, "", 0
+		it.State, it.Reason, it.Retries, it.Finished, it.Affinity, it.Acked, it.Attempt = proto.SQueued, "", 0, 0, "", 0, 0
+		it.PausedBy, it.YieldTo, it.YieldRes, it.YieldedAt = "", "", "", 0
 		if strings.TrimSpace(body) != "resume" {
 			it.Step, it.Resume, it.Checkpoint, it.Progress = 0, false, nil, nil
 			c.db.Exec("DELETE FROM samples WHERE item=?", it.ID)
@@ -268,7 +287,7 @@ func (c *Controller) apply(it *rec, verb, body string) (string, error) {
 	case "top":
 		var m int
 		c.db.QueryRow("SELECT COALESCE(MIN(priority),100) FROM items").Scan(&m)
-		it.Priority = m - 1
+		it.Priority, it.PreemptUntil = m-1, 0
 	case "emit":
 		return c.emit(it, body)
 	case "do":

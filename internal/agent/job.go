@@ -27,7 +27,10 @@ type job struct {
 	Step       int            `json:"step"`
 	Resume     bool           `json:"resume"`
 	ResumeStep int            `json:"resume_step"`
-	StopMode   string         `json:"stop_mode,omitempty"`
+	StopMode   string         `json:"stop_mode,omitempty"` // pause | cancel | yield
+	StopBy     string         `json:"stop_by,omitempty"`   // "" the controller | shutdown | lease:HOLDER | #ID
+	StopRes    string         `json:"stop_res,omitempty"`  // yield: the resource given up
+	StopBoot   string         `json:"stop_boot,omitempty"`
 	StopAt     int64          `json:"stop_at,omitempty"`
 	TermSent   bool           `json:"term_sent,omitempty"`
 	KillSent   bool           `json:"kill_sent,omitempty"`
@@ -230,7 +233,7 @@ func trunc(s string, n int) string {
 func (j *job) report() proto.JobReport {
 	r := proto.JobReport{ID: j.ID, Attempt: j.Attempt, State: j.State, Step: j.Step, RC: j.RC, Reason: j.Reason,
 		Progress: j.P.Progress, Checkpoint: j.P.Checkpoint, Attention: j.P.Attention, LogSize: j.logSize(),
-		Started: j.Started, Finished: j.Finished}
+		Started: j.Started, Finished: j.Finished, StopMode: j.StopMode, StopBy: j.StopBy, StopBoot: j.StopBoot}
 	if j.Step < len(j.Spec.Steps) {
 		r.StepName = j.Spec.Steps[j.Step].Name
 	}

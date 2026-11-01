@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -96,12 +97,15 @@ func Main(cfg *config.Config, cmd string, args []string) {
 		wait(c, args)
 	case "shutdown":
 		shutdown(cfg, args)
-	case "release", "hold", "drain":
-		if cmd != "release" || (len(args) == 1 && !isID(args[0])) {
-			hostCmd(c, cmd, args)
-			return
+	case "lease":
+		leaseCmd(cfg, args)
+	case "leases":
+		leasesCmd(cfg, args)
+	case "host":
+		if len(args) != 2 || (args[0] != "hold" && args[0] != "release" && args[0] != "drain") {
+			die(fmt.Errorf("host hold|release|drain HOST"))
 		}
-		fallthrough
+		hostCmd(c, args[0], args[1])
 	case "pause", "cancel", "resume", "ack", "top", "retry":
 		fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 		resume := fs.Bool("resume", false, "retry: keep the step + checkpoint instead of starting over")
@@ -209,9 +213,13 @@ func usage() {
   gaffer show ID / log ID [-f]               detail + events / console log (-f ends when it settles)
   gaffer wait [--events] [--any] ID...       block until they settle, or one needs you; exit 0 done,
                                              1 failed, 2 needs you, 3 canceled, 124 --timeout
-  gaffer pause|resume|cancel|retry [--resume]|release|ack|top ID...
-  gaffer hold|release HOST                   hold: no new work lands there (running jobs go on); release undoes it
-  gaffer drain HOST                          hold + pause everything running there (prints the ids)
+  gaffer pause|resume|cancel|retry [--resume]|ack|top ID...
+  gaffer lease RES [--holder N] [--class C] [--ttl 30m] [--wait] [--exclusive] [--release] [-- CMD...]
+                                             take a resource on this box for something that isn't a job (a chat
+                                             model, a render UI, a game): its jobs step aside and come back
+  gaffer leases                              who holds what here, and what the probe sees
+  gaffer host hold|release|drain HOST        hold: no new work lands there (running jobs go on); release undoes
+                                             it; drain: hold + pause everything running there
   gaffer shutdown [--wait SEC]               pause every job on this box and wait for it: the OS shutdown hook
   gaffer track TITLE...                      observe work gaffer doesn't run; prints an id
   gaffer emit [ID] LINE...                   ::progress / ::phase / ::checkpoint / ::needs-you / ::done / ::fail
@@ -228,7 +236,14 @@ func submit(c *client, cmd string, args []string) {
 	title := fs.String("title", "", "")
 	host := fs.String("host", "", "run on this agent instead of the one on this box")
 	needs := fs.String("needs", "", "slot label (gpu, cpu…)")
-	prio := fs.Int("prio", 100, "lower runs first")
+	prio, prioSet := 100, false
+	fs.Func("prio", "lower runs first (default 100, or the kind's); a job 50+ below a running one's takes its slot", func(s string) error {
+		n, err := strconv.Atoi(s)
+		prio, prioSet = n, true
+		return err
+	})
+	var shares multi
+	fs.Var(&shares, "shares", "lease class this job can run alongside (repeatable): a Qwen job shares llm")
 	held := fs.String("held", "", "queue held, with this reason")
 	onInt := fs.String("on-interrupt", "", "resume | restart | hold")
 	rx := fs.String("progress-regex", "", "run only: regex with done/total groups")
@@ -289,6 +304,9 @@ func submit(c *client, cmd string, args []string) {
 	if *needs != "" {
 		spec.Needs = *needs
 	}
+	if len(shares) > 0 {
+		spec.Shares = shares
+	}
 	if *onInt != "" {
 		spec.OnInterrupt = *onInt
 	}
@@ -312,8 +330,12 @@ func submit(c *client, cmd string, args []string) {
 	if c.do("GET", "/api/status", nil, &st) == nil && !slices.ContainsFunc(st.Hosts, func(h proto.Host) bool { return h.Host == spec.Host }) {
 		fmt.Fprintf(os.Stderr, "gaffer: note: no agent %q has reported in; this waits until one does\n", spec.Host)
 	}
+	body := map[string]any{"spec": spec, "held": *held}
+	if prioSet {
+		body["priority"] = prio
+	}
 	var r map[string]int64
-	die(c.do("POST", "/api/items", map[string]any{"spec": spec, "priority": *prio, "held": *held}, &r))
+	die(c.do("POST", "/api/items", body, &r))
 	fmt.Printf("#%d queued  %s\n", r["id"], spec.Title)
 }
 
@@ -382,6 +404,7 @@ func show(c *client, args []string) {
 			Kind string `json:"kind"`
 			Msg  string `json:"msg"`
 		} `json:"events"`
+		Leases []proto.Lease `json:"leases"`
 	}
 	die(c.do("GET", "/api/items/"+args[0], nil, &d))
 	it := d.Item
@@ -396,6 +419,42 @@ func show(c *client, args []string) {
 		kv("observed", it.Source+" "+it.Key)
 	} else {
 		kv("attempt", fmt.Sprintf("%d (interrupts %d)", it.Attempt, it.Retries))
+		kv("priority", fmt.Sprint(it.Priority))
+	}
+	if n := it.Spec.NeedsAt(it.Step); n != "cpu" || len(it.Spec.SharesAt(it.Step)) > 0 {
+		s := n
+		if sh := it.Spec.SharesAt(it.Step); len(sh) > 0 {
+			s += ", shares " + strings.Join(sh, " ")
+		}
+		kv("needs", s)
+	}
+	switch {
+	case it.State == proto.SYielded:
+		y := "to " + it.YieldTo
+		if it.YieldedAt > 0 {
+			y += " since " + clockMS(it.YieldedAt)
+		}
+		for _, l := range d.Leases {
+			if l.Res == it.Spec.NeedsAt(it.Step) && strings.HasPrefix(it.YieldTo, l.Holder) {
+				if l.Expires > 0 {
+					y += fmt.Sprintf("; lease expires %s unless refreshed", clockMS(l.Expires))
+				} else {
+					y += fmt.Sprintf("; lease lives with pid %d", l.PID)
+				}
+			}
+		}
+		if strings.HasPrefix(it.YieldTo, "#") {
+			y += "; resumes when it leaves the slot"
+		} else {
+			y += "; resumes ~30 s after the lease goes"
+		}
+		kv("yielded", y)
+	case it.State == proto.SPaused && it.PausedBy == "shutdown":
+		kv("paused by", "the shutdown hook; resumes by itself when "+it.Host+" is back")
+	case it.State == proto.SPaused:
+		kv("paused by", "you  (gaffer resume "+fmt.Sprint(it.ID)+")")
+	case it.State == proto.SStopping && it.StopMode != "":
+		kv("stopping", it.StopMode)
 	}
 	steps := []string{}
 	for i, s := range it.Spec.Steps {
@@ -429,12 +488,33 @@ func show(c *client, args []string) {
 		kv("started", clockMS(it.Started))
 	}
 	if it.Finished > 0 {
-		kv("finished", clockMS(it.Finished)+"  ("+fmtDur(float64(it.Finished-it.Started)/1000)+")")
+		kv("finished", clockMS(it.Finished))
+	}
+	if it.RunMS > 0 {
+		ran := "ran " + fmtDur(float64(it.RunMS)/1000)
+		if it.Attempt > 1 {
+			ran += fmt.Sprintf(" over %d attempts", it.Attempt)
+		}
+		kv("time", ran)
 	}
 	kv("log", fmt.Sprintf("%d bytes  (gaffer log %d)", it.LogSize, it.ID))
 	fmt.Println("  events:")
-	for _, e := range d.Events {
-		fmt.Printf("    %s  %-11s %s\n", clockMS(e.TS), e.Kind, e.Msg)
+	// a run of the same event (500 `assigned` while a fits said no every beat) folds into one line
+	attempt := regexp.MustCompile(`attempt \d+`)
+	for i := 0; i < len(d.Events); {
+		e := d.Events[i]
+		j := i + 1
+		for j < len(d.Events) && d.Events[j].Kind == e.Kind && attempt.ReplaceAllString(d.Events[j].Msg, "attempt N") == attempt.ReplaceAllString(e.Msg, "attempt N") {
+			j++
+		}
+		if j-i >= 3 {
+			fmt.Printf("    %s  %-11s %s  ×%d, until %s\n", clockMS(e.TS), e.Kind, e.Msg, j-i, clockMS(d.Events[j-1].TS))
+		} else {
+			for k := i; k < j; k++ {
+				fmt.Printf("    %s  %-11s %s\n", clockMS(d.Events[k].TS), d.Events[k].Kind, d.Events[k].Msg)
+			}
+		}
+		i = j
 	}
 }
 
@@ -592,17 +672,8 @@ func clock(t time.Time) string {
 
 func clockMS(ms int64) string { return clock(time.UnixMilli(ms)) }
 
-func isID(s string) bool {
-	_, err := strconv.Atoi(s)
-	return err == nil
-}
-
 // hostCmd: hold (no new work there), release, drain (hold + pause what runs there), through the controller.
-func hostCmd(c *client, cmd string, args []string) {
-	if len(args) != 1 {
-		die(fmt.Errorf("%s HOST", cmd))
-	}
-	host := args[0]
+func hostCmd(c *client, cmd, host string) {
 	if cmd == "release" {
 		die(c.do("POST", "/api/hosts/"+host+"/release", "", nil))
 		fmt.Printf("%s released\n", host)
@@ -615,7 +686,6 @@ func hostCmd(c *client, cmd string, args []string) {
 	}
 	var st proto.Status
 	die(c.do("GET", "/api/status", nil, &st))
-	var paused []int64
 	for _, it := range st.Items {
 		if it.Host != host || it.Source != "" || it.Parent != 0 {
 			continue // actions run to the end; observed items aren't ours to stop
@@ -627,7 +697,6 @@ func hostCmd(c *client, cmd string, args []string) {
 				fmt.Fprintf(os.Stderr, "gaffer: #%d: %v\n", it.ID, err)
 				continue
 			}
-			paused = append(paused, it.ID)
 			fmt.Printf("#%d -> %s\n", it.ID, r["ok"])
 		}
 	}
@@ -636,7 +705,7 @@ func hostCmd(c *client, cmd string, args []string) {
 // shutdown is the OS shutdown hook, and works with the network already gone: it asks this box's agent
 // (a file in its dir) to pause every running job, then blocks until none is running, so systemd waits.
 // The agent records the pauses on disk and reports them when it next reaches the controller, after the
-// reboot if need be; the jobs come back paused, for `gaffer resume`. Nothing to do if no agent is up.
+// reboot if need be; they come back by themselves once the host does. Nothing to do if no agent is up.
 func shutdown(cfg *config.Config, args []string) {
 	fs := flag.NewFlagSet("shutdown", flag.ExitOnError)
 	wait := fs.Int("wait", 60, "seconds to wait for the jobs to stop")
@@ -673,14 +742,16 @@ func shutdown(cfg *config.Config, args []string) {
 		fmt.Println("nothing running here; safe to go down")
 		return
 	}
-	die(os.WriteFile(filepath.Join(dir, "pause-all"), []byte(time.Now().Format(time.RFC3339)+"\n"), 0o644))
-	defer os.Remove(filepath.Join(dir, "pause-all"))
+	pauseAll := filepath.Join(dir, "pause-all")
+	die(os.WriteFile(pauseAll, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o644))
 	fmt.Printf("pausing %s\n", strings.Join(ids, " "))
 	deadline := time.Now().Add(time.Duration(*wait) * time.Second)
 	for {
 		time.Sleep(time.Second)
+		// the file stays: the host reports itself held while it is fresh (two minutes), and the agent removes
+		// it when it next starts (after the reboot). An aborted shutdown lifts the hold by itself.
 		if left, ids := running(); left == 0 {
-			fmt.Printf("%d paused, safe to go down\n", n)
+			fmt.Printf("%d paused, safe to go down; they resume by themselves when this box is back\n", n)
 			return
 		} else if time.Now().After(deadline) {
 			fmt.Fprintf(os.Stderr, "gaffer: %s still stopping after %ds; going down anyway (interrupted, they follow their kind's policy)\n", strings.Join(ids, " "), *wait)
