@@ -201,7 +201,7 @@ func (a *Agent) acquire(req proto.LeaseReq, t int64) proto.LeaseResp {
 			l.Expires = t + req.TTLMS
 		}
 		a.saveLease(l)
-		return a.leaseStatus(l, "refreshed", t)
+		return a.leaseStatus(l, "refreshed", t, false) // a refresh is a heartbeat: nobody is waiting, don't go clearing things
 	}
 	for _, o := range a.leasesOn(req.Res) {
 		if o.Exclusive || req.Exclusive {
@@ -224,7 +224,7 @@ func (a *Agent) acquire(req proto.LeaseReq, t int64) proto.LeaseResp {
 	a.leases[key] = l
 	log.Printf("lease %s on %s granted", l.text(), l.Res)
 	a.enforceLeases(t)
-	resp := a.leaseStatus(l, "granted", t)
+	resp := a.leaseStatus(l, "granted", t, true)
 	for _, j := range a.jobs {
 		if j.StopMode == "yield" && j.StopBy == "lease:"+l.Holder && j.State == proto.JRunning {
 			resp.Bumping = append(resp.Bumping, j.ID)
@@ -245,8 +245,9 @@ func (a *Agent) release(res, holder string) bool {
 
 // leaseStatus: is the resource actually free for this holder? No step of gaffer's that must yield to it
 // is still alive, no process of such a step is still on it (the probe says), and foreign residents are
-// at or below idle (the release hook is run once a minute to get them there).
-func (a *Agent) leaseStatus(l *lease, state string, t int64) proto.LeaseResp {
+// at or below idle (with `clear`, the release hook is run once a minute to get them there: for a grant
+// and for a --wait poll, not for a heartbeat refresh).
+func (a *Agent) leaseStatus(l *lease, state string, t int64, clear bool) proto.LeaseResp {
 	resp := proto.LeaseResp{State: state}
 	p := l.proto()
 	resp.Lease = &p
@@ -276,7 +277,7 @@ func (a *Agent) leaseStatus(l *lease, state string, t int64) proto.LeaseResp {
 			}
 		}
 		if len(resp.Pending) == 0 {
-			if a.foreignMiB(l.Res) > a.idleMiB(l.Res) && (l.releasedAt == 0 || t-l.releasedAt > 60000) {
+			if clear && a.foreignMiB(l.Res) > a.idleMiB(l.Res) && (l.releasedAt == 0 || t-l.releasedAt > 60000) {
 				if a.releaseIdle(l.Res, l.Holder, nil, t) {
 					l.releasedAt = t
 				}

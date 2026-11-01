@@ -44,7 +44,7 @@ func (a *Agent) listen() error {
 			if l == nil {
 				return proto.LeaseResp{State: "gone", Reason: "no lease by " + holder + " on " + res}
 			}
-			return a.leaseStatus(l, "held", now())
+			return a.leaseStatus(l, "held", now(), true)
 		})
 	})
 	m.HandleFunc("DELETE /lease/{res}/{holder}", func(w http.ResponseWriter, r *http.Request) {
