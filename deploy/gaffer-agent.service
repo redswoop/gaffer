@@ -6,8 +6,11 @@ After=network-online.target
 ExecStart=%h/.local/bin/gaffer agent
 Restart=always
 RestartSec=5
-# Steps run detached under setsid in this cgroup; restarting the agent must not take them down.
+# Steps run in transient scopes of their own (systemd-run --scope), or detached under setsid in this cgroup
+# where that isn't available; restarting the agent must not take them down.
 KillMode=process
+# The agent is the supervisor: a memory hog is some job's, in its own scope, and that is what oomd should take.
+ManagedOOMPreference=omit
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]

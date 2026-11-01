@@ -46,6 +46,7 @@ type Agent struct {
 	obsBusy map[string]bool
 	obsDone chan string
 	lock    *os.File // agent.lock, held for the agent's whole life (see Run)
+	scopes  bool     // steps run in transient systemd scopes (own cgroup each): an OOM kill takes one job, not the agent
 }
 
 func now() int64 { return time.Now().UnixMilli() }
@@ -69,13 +70,15 @@ func Run(cfg *config.Config) error {
 		return fmt.Errorf("another agent holds %s", lock.Name())
 	}
 	a.lock = lock // keep it referenced: a finalized *os.File closes the fd, and that drops the flock
+	a.scopes = exec.Command("systemd-run", "--user", "--scope", "--quiet", "--collect", "true").Run() == nil
 	dirs, _ := filepath.Glob(filepath.Join(a.dir, "jobs", "*"))
 	for _, d := range dirs {
 		if j, err := loadJob(d); err == nil {
 			a.jobs[j.ID] = j
 		}
 	}
-	log.Printf("agent %s up (boot %.8s), %d job dirs, controller %s", a.host, bootID(), len(a.jobs), cfg.Controller)
+	log.Printf("agent %s up (boot %.8s), %d job dirs, controller %s, steps in %s", a.host, bootID(), len(a.jobs), cfg.Controller,
+		map[bool]string{true: "systemd scopes", false: "plain sessions (no systemd-run --user)"}[a.scopes])
 	os.Remove(a.pauseAllPath()) // a request from before a restart or reboot is void: nothing of that is running
 	lastSync := int64(0)
 	for {
@@ -249,7 +252,15 @@ func (a *Agent) spawn(j *job, t int64) {
 	os.Remove(rcPath(j.dir, j.Attempt, j.Step))
 	os.Remove(pidPath(j.dir, j.Attempt, j.Step))
 	j.save() // before the start: a restart in between must know a shim may exist
-	cmd := exec.Command(a.exe, "_shim", j.dir, strconv.Itoa(j.Attempt), strconv.Itoa(j.Step))
+	args := []string{a.exe, "_shim", j.dir, strconv.Itoa(j.Attempt), strconv.Itoa(j.Step)}
+	if a.scopes {
+		// Its own cgroup: systemd-oomd (and `systemctl kill`) can take one job without touching the agent or the
+		// others; ordered before the shutdown hook, so the hook pauses it before systemd gets to stop it.
+		// systemd-run --scope execs the command in place, so the pid is the shim's.
+		unit := fmt.Sprintf("gaffer-%s-%d-%d-%d", a.host, j.ID, j.Attempt, j.Step)
+		args = append([]string{"systemd-run", "--user", "--scope", "--quiet", "--collect", "--unit", unit, "-p", "Before=gaffer-shutdown.service"}, args...)
+	}
+	cmd := exec.Command(args[0], args[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		a.end(j, proto.JFailed, "spawn: "+err.Error(), t)

@@ -135,6 +135,9 @@ The design point is `kill -9` at any instant, because a shutdown gives a few sec
   output appended straight to the job log, its identity (`boot_id + pid + start time`) and exit code
   written to the job dir. The agent only watches files, so restarting, upgrading or crashing the agent
   never touches a running step, and neither a reboot nor pid reuse can make a dead job look alive.
+  Where `systemd-run --user` works, each step also gets a transient scope of its own
+  (`gaffer-HOST-ID-ATTEMPT-STEP.scope`): its own cgroup, so systemd-oomd takes one hungry job, not the
+  agent and everything else it runs, and ordered before the shutdown hook so the hook gets to pause it.
 - **Everything is on disk, and reconciled.** Agents re-read their job dirs on start: alive → adopt;
   exit code → finish; neither → interrupted. The controller is level-triggered off agent reports, so a
   lost message, either side restarting or the network going away converges instead of drifting. An

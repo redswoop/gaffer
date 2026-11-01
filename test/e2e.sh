@@ -146,7 +146,11 @@ check "a second agent is refused"     eval 'GAFFER_CONFIG=$T/alpha.toml timeout 
 
 echo "-- pause = TERM, checkpoint, free the slot; resume picks up there"
 j=$(submit fake --host alpha -e FAKE_SLEEP=0.3 -- 40)
-done_ge "$j" 8 30; g pause "$j" >/dev/null
+done_ge "$j" 8 30
+if systemctl --user is-system-running >/dev/null 2>&1; then
+check "step runs in its own scope"    eq "$(systemctl --user is-active "gaffer-alpha-$j-1-1.scope")" active
+fi
+g pause "$j" >/dev/null
 check "paused"                        state "$j" paused 20
 check "checkpoint taken on TERM"      wait_for "$j" '((.checkpoint.data.unit|tonumber) >= 8)' 5
 g resume "$j" >/dev/null
