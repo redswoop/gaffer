@@ -179,19 +179,24 @@ func alivePID(pid int) bool {
 	return ok && st != "Z" && st != "X"
 }
 
-// foreignMiB: what the probe sees on the resource that isn't a job of ours.
+// foreignMiB: what the probe sees on the resource that isn't a job of ours: the sum of the foreign processes'
+// shares (per-process figures leave out the driver's own overhead, so `used - ours` would overstate it by a
+// GB or so per process). A probe that lists no processes at all is read as "used is all foreign".
 func (a *Agent) foreignMiB(res string) int {
 	p := a.res[res]
 	if p == nil {
 		return 0
 	}
-	mine := 0
+	if len(p.Procs) == 0 {
+		return p.Used
+	}
+	foreign := 0
 	for _, pc := range p.Procs {
-		if !alivePID(pc.PID) || a.jobOfPID(pc.PID) != nil { // a dead pid is a stale reading, not a resident
-			mine += pc.MiB
+		if alivePID(pc.PID) && a.jobOfPID(pc.PID) == nil { // a dead pid is a stale reading, not a resident
+			foreign += pc.MiB
 		}
 	}
-	return max(0, p.Used-mine)
+	return foreign
 }
 
 func (a *Agent) foreignNames(res string) []string {

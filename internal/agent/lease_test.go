@@ -126,12 +126,13 @@ func TestProbeFold(t *testing.T) {
 	a.cfg.Agent.Resources = map[string]config.Resource{"gpu": {Probe: "true", IdleMiB: 1500}}
 	a.res["gpu"] = &probed{}
 	a.fold("gpu", "used=14000 total=32000\n10463 sunshine 508\n999999 ghost 7000\n", 1000)
+	a.res["gpu"].Procs[0].PID = os.Getpid() // a live foreign process (this test) worth 508
 	p := a.res["gpu"]
 	if p.Used != 14000 || p.Total != 32000 || len(p.Procs) != 2 || p.UsedSince != 1000 {
 		t.Fatalf("fold: %+v", p)
 	}
-	if got := a.foreignMiB("gpu"); got != 7000 { // the dead pid's share is not foreign
-		t.Errorf("foreign = %d, want 7000", got)
+	if got := a.foreignMiB("gpu"); got != 508 { // the dead pid's share is not foreign; neither is the driver's overhead
+		t.Errorf("foreign = %d, want 508", got)
 	}
 	a.fold("gpu", "used=14100 total=32000\n", 5000)
 	if p.UsedSince != 1000 {
