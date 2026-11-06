@@ -156,6 +156,52 @@ func (a *Agent) jobOfPID(pid int) *job {
 	return nil
 }
 
+// procPPID is the parent pid, 0 if the process is gone.
+func procPPID(pid int) int {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0
+	}
+	s := string(b)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 {
+		return 0
+	}
+	f := strings.Fields(s[i+1:])
+	if len(f) < 2 {
+		return 0
+	}
+	n, _ := strconv.Atoi(f[1])
+	return n
+}
+
+// holderPIDs: the live processes of the leases on res (a holder that said `--pid`, or a `-- CMD` lease's
+// own process). What they, or their descendants, keep on the resource is the holder's, not foreign: a
+// render UI's cached models are the very thing its lease is for, and a waiter must never wait on itself.
+func (a *Agent) holderPIDs(res string) map[int]bool {
+	var out map[int]bool
+	for _, l := range a.leasesOn(res) {
+		if l.Ident != nil && l.Ident.alive() {
+			if out == nil {
+				out = map[int]bool{}
+			}
+			out[l.Ident.PID] = true
+		}
+	}
+	return out
+}
+
+// ownedBy: pid is one of the holders, or descends from one (a chat router's model server, a UI's worker).
+func ownedBy(pid int, holders map[int]bool) bool {
+	for i := 0; pid > 1 && i < 64; i++ {
+		if holders[pid] {
+			return true
+		}
+		pid = procPPID(pid)
+	}
+	return false
+}
+
 func procPGID(pid int) int {
 	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
@@ -179,8 +225,8 @@ func alivePID(pid int) bool {
 	return ok && st != "Z" && st != "X"
 }
 
-// foreignMiB: what the probe sees on the resource that isn't a job of ours: the sum of the foreign processes'
-// shares (per-process figures leave out the driver's own overhead, so `used - ours` would overstate it by a
+// foreignMiB: what the probe sees on the resource that isn't a job of ours or a lease holder's: the sum of the
+// foreign processes' (per-process figures leave out the driver's own overhead, so `used - ours` would overstate it by a
 // GB or so per process). A probe that lists no processes at all is read as "used is all foreign".
 func (a *Agent) foreignMiB(res string) int {
 	p := a.res[res]
@@ -192,11 +238,17 @@ func (a *Agent) foreignMiB(res string) int {
 	}
 	foreign := 0
 	for _, pc := range p.Procs {
-		if alivePID(pc.PID) && a.jobOfPID(pc.PID) == nil { // a dead pid is a stale reading, not a resident
+		if a.foreignProc(res, pc) {
 			foreign += pc.MiB
 		}
 	}
 	return foreign
+}
+
+// foreignProc: a live process on the resource that is neither a job of ours nor a lease holder's (a dead
+// pid is a stale reading, not a resident).
+func (a *Agent) foreignProc(res string, pc proc) bool {
+	return alivePID(pc.PID) && a.jobOfPID(pc.PID) == nil && !ownedBy(pc.PID, a.holderPIDs(res))
 }
 
 func (a *Agent) foreignNames(res string) []string {
@@ -206,7 +258,7 @@ func (a *Agent) foreignNames(res string) []string {
 	}
 	var out []string
 	for _, pc := range p.Procs {
-		if alivePID(pc.PID) && a.jobOfPID(pc.PID) == nil {
+		if a.foreignProc(res, pc) {
 			out = append(out, fmt.Sprintf("%s %s", filepath.Base(pc.Name), gib(pc.MiB)))
 		}
 	}

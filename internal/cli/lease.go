@@ -90,6 +90,7 @@ func leaseCmd(cfg *config.Config, args []string) {
 	wait := fs.Bool("wait", false, "return only once the resource is actually free (implied with -- CMD)")
 	timeout := fs.Duration("timeout", 90*time.Second, "give up waiting after this long")
 	exclusive := fs.Bool("exclusive", false, "refuse every other lease (and every job) while held")
+	pid := fs.Int("pid", 0, "the holder's process: what it (and its children) keep on the resource is not foreign (with -- CMD: this process)")
 	release := fs.Bool("release", false, "give the lease up")
 	res := ""
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -101,7 +102,7 @@ func leaseCmd(cfg *config.Config, args []string) {
 		res, rest = rest[0], rest[1:]
 	}
 	if res == "" {
-		fmt.Fprintln(os.Stderr, "gaffer: lease RES [--holder NAME] [--class C] [--ttl DUR] [--wait] [--exclusive] [--release] [-- CMD...]")
+		fmt.Fprintln(os.Stderr, "gaffer: lease RES [--holder NAME] [--class C] [--ttl DUR] [--wait] [--pid N] [--exclusive] [--release] [-- CMD...]")
 		os.Exit(leaseUsage)
 	}
 	cmd := rest
@@ -123,7 +124,7 @@ func leaseCmd(cfg *config.Config, args []string) {
 		fmt.Printf("%s: %s (%s)\n", res, r.Reason, *holder)
 		return
 	}
-	req := proto.LeaseReq{Res: res, Holder: *holder, Class: *class, Exclusive: *exclusive, TTLMS: ttl.Milliseconds()}
+	req := proto.LeaseReq{Res: res, Holder: *holder, Class: *class, Exclusive: *exclusive, TTLMS: ttl.Milliseconds(), PID: *pid}
 	if id, err := strconv.ParseInt(os.Getenv("W_ID"), 10, 64); err == nil {
 		req.Job = id // from inside a job: that job is a co-holder, never bumped by its own lease
 	}
@@ -258,6 +259,8 @@ func leasesCmd(cfg *config.Config, args []string) {
 		life := "until " + clockMS(l.Expires) + " unless refreshed"
 		if l.Expires == 0 {
 			life = fmt.Sprintf("while pid %d lives", l.PID)
+		} else if l.PID > 0 {
+			life += fmt.Sprintf(", pid %d", l.PID)
 		}
 		ex := ""
 		if l.Exclusive {

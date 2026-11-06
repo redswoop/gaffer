@@ -1,8 +1,11 @@
 package agent
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gaffer/internal/config"
@@ -149,5 +152,43 @@ func TestProbeFold(t *testing.T) {
 	r := a.resourceReports()["gpu"]
 	if r.Used != 4000 || r.Total != 32000 {
 		t.Errorf("report: %+v", r)
+	}
+}
+
+// A lease holder's own process, and anything under it, is not a foreign resident: a UI's cached models are
+// what its lease is for, and its --wait must not wait on itself.
+func TestHolderResidentsAreNotForeign(t *testing.T) {
+	a := testAgent(t)
+	a.cfg.Agent.Resources = map[string]config.Resource{"gpu": {Probe: "true", IdleMiB: 1500}}
+	a.res["gpu"] = &probed{}
+	child := exec.Command("sleep", "30")
+	if err := child.Start(); err != nil {
+		t.Skip("no sleep:", err)
+	}
+	defer child.Process.Kill()
+	a.fold("gpu", fmt.Sprintf("used=20000 total=32000\n%d python 17800\n%d sleep 2000\n", os.Getpid(), child.Process.Pid), 1000)
+	if got := a.foreignMiB("gpu"); got != 19800 {
+		t.Fatalf("before any lease, foreign = %d, want 19800", got)
+	}
+	r := a.acquire(proto.LeaseReq{Res: "gpu", Holder: "comfy", TTLMS: 60000}, 1000)
+	if !r.Ready || !strings.Contains(strings.Join(r.Pending, ";"), "python 17.4G (not gaffer's)") {
+		// a lease without a pid still sees the residents as foreign
+		if r.Ready {
+			t.Fatalf("a lease without --pid was ready over 19.8G of residents: %+v", r)
+		}
+	}
+	r = a.acquire(proto.LeaseReq{Res: "gpu", Holder: "comfy", TTLMS: 60000, PID: os.Getpid()}, 2000)
+	if r.State != "refreshed" || !r.Ready || len(r.Pending) != 0 {
+		t.Fatalf("with --pid on the refresh, want ready: %+v", r)
+	}
+	if got := a.foreignMiB("gpu"); got != 0 {
+		t.Errorf("holder's residents counted as foreign: %d", got)
+	}
+	if h := a.resourceReports()["gpu"].Holders; len(h) != 1 || h[0] != "comfy" {
+		t.Errorf("holders = %v, want just the lease", h)
+	}
+	a.release("gpu", "comfy")
+	if got := a.foreignMiB("gpu"); got != 19800 {
+		t.Errorf("after the release, foreign = %d, want 19800", got)
 	}
 }

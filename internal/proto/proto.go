@@ -123,8 +123,8 @@ type Lease struct {
 	Since     int64  `json:"since"`
 	Refreshed int64  `json:"refreshed"`
 	Expires   int64  `json:"expires,omitempty"` // 0: process-bound
-	PID       int    `json:"pid,omitempty"`
-	Job       int64  `json:"job,omitempty"` // taken from inside this job: it is a co-holder, never bumped
+	PID       int    `json:"pid,omitempty"`     // the holder's process (bound to it without a TTL; named with one)
+	Job       int64  `json:"job,omitempty"`     // taken from inside this job: it is a co-holder, never bumped
 }
 
 // LeaseReq / LeaseResp are `gaffer lease` talking to the local agent over its unix socket.
@@ -134,7 +134,7 @@ type LeaseReq struct {
 	Class     string `json:"class"`
 	Exclusive bool   `json:"exclusive,omitempty"`
 	TTLMS     int64  `json:"ttl_ms,omitempty"` // 0: process-bound (PID/Boot/Start identify the holder)
-	PID       int    `json:"pid,omitempty"`
+	PID       int    `json:"pid,omitempty"`    // the holder's process; with a TTL, what it and its children keep on the resource isn't foreign
 	Boot      string `json:"boot,omitempty"`
 	Start     uint64 `json:"start,omitempty"`
 	Scope     string `json:"scope,omitempty"` // the holder's systemd scope, if it runs in one: the lease lives while it is active
@@ -153,7 +153,7 @@ type LeaseResp struct {
 // ResourceReport is what the agent's probe hook says about a resource (used by the board header and by
 // `gaffer lease --wait`): how much is in use, since when it last changed, and who the holders are.
 type ResourceReport struct {
-	Used    int      `json:"used"`              // MiB (or whatever the probe counts)
+	Used    int      `json:"used"` // MiB (or whatever the probe counts)
 	Total   int      `json:"total"`
 	Idle    int64    `json:"idle"`              // ms since `used` last moved
 	Holders []string `json:"holders,omitempty"` // leases, then jobs (#id), then foreign process names
@@ -279,17 +279,17 @@ const (
 )
 
 type Host struct {
-	Host     string         `json:"host"`
-	BootID   string         `json:"boot_id"`
-	Version  string         `json:"version"`
-	Slots    map[string]int `json:"slots"`
-	Used     map[string]int `json:"used"`
-	Seen     int64          `json:"seen"`
-	Online   bool           `json:"online"`
-	Held     bool           `json:"held"` // takes no new work: by hand, the breaker, or while it pauses everything for a shutdown
-	Note     string         `json:"note,omitempty"`
-	Failures int            `json:"failures"`
-	Leases   []Lease        `json:"leases,omitempty"`
+	Host      string                    `json:"host"`
+	BootID    string                    `json:"boot_id"`
+	Version   string                    `json:"version"`
+	Slots     map[string]int            `json:"slots"`
+	Used      map[string]int            `json:"used"`
+	Seen      int64                     `json:"seen"`
+	Online    bool                      `json:"online"`
+	Held      bool                      `json:"held"` // takes no new work: by hand, the breaker, or while it pauses everything for a shutdown
+	Note      string                    `json:"note,omitempty"`
+	Failures  int                       `json:"failures"`
+	Leases    []Lease                   `json:"leases,omitempty"`
 	Resources map[string]ResourceReport `json:"resources,omitempty"`
 }
 

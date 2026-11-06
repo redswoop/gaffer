@@ -29,7 +29,7 @@ type lease struct {
 	Refreshed int64  `json:"refreshed"`
 	Expires   int64  `json:"expires,omitempty"` // 0: process-bound
 	Boot      string `json:"boot"`
-	Ident     *ident `json:"ident,omitempty"` // the holder process (process-bound)
+	Ident     *ident `json:"ident,omitempty"` // the holder process: a process-bound lease lives with it; a TTL lease's `--pid` (its residents aren't foreign)
 	Scope     string `json:"scope,omitempty"` // its systemd scope, if any: the lease lives while that is active
 	Job       int64  `json:"job,omitempty"`   // taken from inside this job, which is then a co-holder
 
@@ -211,6 +211,9 @@ func (a *Agent) acquire(req proto.LeaseReq, t int64) proto.LeaseResp {
 		l.Refreshed = t
 		if req.TTLMS > 0 {
 			l.Expires = t + req.TTLMS
+			if req.PID > 0 && (l.Ident == nil || l.Ident.PID != req.PID) { // the holder restarted: follow it
+				l.Ident = holderIdent(req)
+			}
 		}
 		a.saveLease(l)
 		return a.leaseStatus(l, "refreshed", t, false) // a refresh is a heartbeat: nobody is waiting, don't go clearing things
@@ -224,11 +227,14 @@ func (a *Agent) acquire(req proto.LeaseReq, t int64) proto.LeaseResp {
 		Boot: bootID(), Scope: req.Scope, Job: req.Job}
 	if req.TTLMS > 0 {
 		l.Expires = t + req.TTLMS
+		if req.PID > 0 {
+			l.Ident = holderIdent(req) // named, not bound: the TTL still rules its life
+		}
 	} else {
 		if req.PID == 0 && req.Scope == "" {
 			return proto.LeaseResp{State: "refused", Reason: "a lease without a ttl needs a holder process"}
 		}
-		l.Ident = &ident{PID: req.PID, Boot: bootID(), Start: req.Start} // the holder is on this box: this boot, whatever it thinks
+		l.Ident = holderIdent(req)
 	}
 	if err := a.saveLease(l); err != nil {
 		return proto.LeaseResp{State: "refused", Reason: "can't record the lease: " + err.Error()}
@@ -244,6 +250,17 @@ func (a *Agent) acquire(req proto.LeaseReq, t int64) proto.LeaseResp {
 	}
 	sort.Slice(resp.Bumping, func(i, k int) bool { return resp.Bumping[i] < resp.Bumping[k] })
 	return resp
+}
+
+// holderIdent: the holder is on this box, so this boot whatever it thinks. A process-bound lease must say
+// its start time (that is what makes it that process, not a reused pid); a TTL lease's `--pid` from a script
+// is just a pid, so its start time is read off /proc.
+func holderIdent(req proto.LeaseReq) *ident {
+	id := &ident{PID: req.PID, Boot: bootID(), Start: req.Start}
+	if id.Start == 0 && req.TTLMS > 0 {
+		_, id.Start, _ = procStat(req.PID)
+	}
+	return id
 }
 
 func (a *Agent) release(res, holder string) bool {
