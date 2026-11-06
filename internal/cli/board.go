@@ -334,9 +334,13 @@ func counts(it proto.Item) string {
 	case p == nil || p.Unit == "%":
 		return ""
 	case p.Total > 0:
-		return fmt.Sprintf("%g/%g %s", p.Done, p.Total, unit(it))
+		c := ofTotal(p.Done, p.Total, unit(it))
+		if isBytes(unit(it)) && it.Rate > 0 && it.State == proto.SRunning {
+			c += "  " + rate(it.Rate, unit(it))
+		}
+		return c
 	case p.Done > 0:
-		return fmt.Sprintf("%g %s", p.Done, unit(it))
+		return count(p.Done, unit(it))
 	}
 	return ""
 }

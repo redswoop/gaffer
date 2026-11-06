@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# hfk plan ARGS... | hfk poll   (see kind.toml). Runs in a job step: W_JOBDIR is the job's scratch dir.
+set -euo pipefail
+cmd=${1:-}; shift || true
+HF_BIN=$(command -v hf) || { echo "hf not on PATH (uv tool install huggingface-hub)" >&2; exit 1; }
+PY=${HFK_PYTHON:-$(head -1 "$HF_BIN" | sed 's/^#!//')}
+exec "$PY" -I "$(dirname "$0")/hfk.py" "$cmd" "$@"

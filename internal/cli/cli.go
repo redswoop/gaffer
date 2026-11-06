@@ -470,7 +470,7 @@ func show(c *client, args []string) {
 		kv("eta", fmtDur(it.ETA)+" ("+clock(time.Now().Add(time.Duration(it.ETA)*time.Second))+")")
 	}
 	if it.Rate > 0 {
-		kv("rate", fmt.Sprintf("%.3g %s/s", it.Rate, unit(it)))
+		kv("rate", rate(it.Rate, unit(it)))
 	}
 	if it.Checkpoint != nil {
 		kv("checkpoint", fmt.Sprintf("step %d %v @ %g", it.Checkpoint.Step, it.Checkpoint.Data, it.Checkpoint.Done))
@@ -614,10 +614,10 @@ func progText(it proto.Item, width int) string {
 		f := min(1, p.Done/p.Total)
 		parts = append(parts, bar(f, width), fmt.Sprintf("%3.0f%%", f*100))
 		if p.Unit != "%" {
-			parts = append(parts, fmt.Sprintf("%g/%g %s", p.Done, p.Total, unit(it)))
+			parts = append(parts, ofTotal(p.Done, p.Total, unit(it)))
 		}
 	} else if p.Done > 0 {
-		parts = append(parts, fmt.Sprintf("%g %s", p.Done, unit(it)))
+		parts = append(parts, count(p.Done, unit(it)))
 	}
 	if p.Phase != "" {
 		parts = append(parts, "["+p.Phase+"]")

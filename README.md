@@ -24,7 +24,7 @@ gaffer show ID / log ID [-f]              # detail + event history / console log
 gaffer wait [--events] [--any] ID...      # block until they settle or one needs you (see Waiting)
 gaffer pause|resume|cancel|retry [--resume]|ack|top ID...
                                           # ack: a needs-you is answered, a failure seen (off FAILED, kept)
-gaffer lease RES [--holder N] [--class C] [--ttl 30m] [--wait] [--exclusive] [--release] [-- CMD...]
+gaffer lease RES [--holder N] [--class C] [--ttl 30m] [--wait] [--pid N] [--exclusive] [--release] [-- CMD...]
                                           # take a resource on this box for something that isn't a job (see Leases)
 gaffer leases                             # who holds what on this box, and what the probe sees
 gaffer host hold|release|drain HOST       # hold: no new work lands there (running jobs go on); release undoes it;
@@ -96,6 +96,7 @@ controller away); `gaffer lease` talks to this box's agent over a unix socket, n
 gaffer lease gpu --holder qwen --class llm --ttl 30m          # take it, or refresh it: idempotent per holder
 gaffer lease gpu --holder qwen --class llm --ttl 30m --wait   # ...and return once it is actually free (<= --timeout, 90 s)
 gaffer lease gpu --holder game --exclusive -- steam %command% # process-bound: held while the command's scope lives
+gaffer lease gpu --holder comfy --ttl 10m --wait --pid $PPID       # ...my own process's residents are mine, not foreign
 gaffer lease gpu --holder qwen --release
 gaffer leases
 ```
@@ -119,7 +120,9 @@ gaffer leases
   "no step of gaffer's is left on it and the probe sees nothing foreign above `idle_mib`": the release hook
   is run once a minute to clear what is idle (cached models, an idle server), told who is waiting so it can
   spare them. The same hook runs before a job takes an unleased resource that residents still occupy, told
-  what the step shares. Without hooks, `--wait` returns when the steps are gone.
+  what the step shares. Without hooks, `--wait` returns when the steps are gone. A holder names its own
+  process with `--pid` (a `-- CMD` lease does by itself): what that process and its children keep on the
+  resource is the holder's, not foreign, so a render UI's cached models never make its own `--wait` wait.
 - Exit codes: `0` granted (and free, with `--wait`), `1` refused / timed out / gone, `2` usage, `3` no agent here.
   On a timeout the output names what is still on the resource (`#309 still stopping (KILL in 12s)`,
   `comfy-main 9.8G (not gaffer's)`); a TTL lease stays, a process lease is released and the command not run.
@@ -269,6 +272,9 @@ card); who else wants the resource is gaffer's business (leases, the release hoo
 
 Step environment: `W_ID W_ATTEMPT W_STEP W_STEP_NAME W_JOBDIR W_STATE W_LOG W_HOST W_KIND_DIR W_RESUME`
 (+ `W_CHECKPOINT`, `W_CKPT_*` on resume), the kind's `env`, `-e` from submit, and `gaffer` on `PATH`.
+
+`kinds/hf` is a real one: `gaffer submit hf -- REPO_ID [FILE...] --local-dir DIR` (any `hf download` flags) with exact
+byte progress, a free-disk check up front, and resume-by-rerun after an interrupt. Needs `hf` on PATH.
 
 `kinds/fake` is the test kind: every progress path, checkpoints, TERM handling, and
 `FAKE_FAIL / FAKE_HANG / FAKE_ASK / FAKE_TERM_IGNORE / FAKE_FITS_SLEEP` to make it fail, wedge, ask, ignore TERM or dawdle in fits.

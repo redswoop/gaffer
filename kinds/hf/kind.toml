@@ -1,0 +1,23 @@
+# Hugging Face download: `hf download` as a gaffer job, with the byte progress the CLI won't print off a tty.
+#   gaffer submit hf -- REPO_ID [FILE...] --local-dir DIR [--include G] [--exclude G] [--revision R] [--repo-type T]
+# The args are `hf download`'s own (--local-dir is required: progress comes from the files landing there).
+# plan   : exact sizes from the Hub (dry run), refuses if the target disk can't hold them (HF_MIN_FREE_GB, default 2 spare)
+# fetch  : the real `hf download`; an interrupt (reboot, agent kill) resumes the partial files by just rerunning
+# Needs `hf` on PATH on the host that runs it (uv tool install huggingface-hub). Gated repos: `hf auth login` or
+# HF_TOKEN in the agent's environment, not `--token` on the command line (it would be stored in the job's spec and log).
+title = "hf {{1}}"
+needs = "cpu"
+on_interrupt = "resume"
+stop_grace = 15
+stall_after = 600
+max_retries = 5
+progress_poll = '$W_KIND_DIR/hfk poll'
+poll_every = 5
+
+[[steps]]
+name = "plan"
+run = '$W_KIND_DIR/hfk plan "$@"'
+
+[[steps]]
+name = "fetch"
+run = 'gaffer emit "::phase fetch"; hf download "$@" >/dev/null; rc=$?; $W_KIND_DIR/hfk poll; exit $rc'

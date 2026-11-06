@@ -441,6 +441,14 @@ j4=$(submit fake --host alpha --needs gpu -e FAKE_SLEEP=0.3 -- 40); done_ge "$j4
 lease gpu --holder t5 --class llm --ttl 3s --wait >/dev/null
 check "TTL: the lease expires on its own" eval 'state "$j4" yielded 20 && state "$j4" running 20'
 g cancel "$j4" >/dev/null
+# a resume is a fresh start for the stall clock: progress from before a long yield is not "no movement". The controller
+# checks every 10 s, so a unit (11 s) must outlast a tick yet stay under stall_after (14 s), and the yield must outlast it.
+j4s=$(submit fake --host alpha --needs gpu --stall 14 -e FAKE_SLEEP=11 -- 40); done_ge "$j4s" 1 40
+lease gpu --holder t5s --class llm --ttl 16s --wait >/dev/null
+check "stall: yielded longer than stall_after" eval 'state "$j4s" yielded 20 && state "$j4s" running 30'
+sleep 13
+check "  a resume isn't stalled at once" eval '[ "$(f "$j4s" .stalled)" != true ] && ! g show "$j4s" | grep -q "  stalled  "'
+g cancel "$j4s" >/dev/null
 "$BIN" lease gpu --holder p1 -- sleep 3017 > "$T/lease-p1.out" 2>&1 & lp=$!; sleep 3
 check "a process lease lives with its command" eval 'g leases | grep -q "gpu *p1 (p1).*while pid"'
 kill -9 $lp 2>/dev/null; pkill -9 -f "sleep 3017"; sleep 4
@@ -472,6 +480,8 @@ state "$r2" needs-you 30 >/dev/null; g ack "$r2" >/dev/null
 sleep 3019 & fp=$!; echo "$fp sleep 7000" > "$T/probe.procs"; echo 20000 > "$T/probe.used"; touch "$T/release.off"; sleep 6
 check "the header shows a foreign holder" eval 'g ls | grep -q "gpu 0/1 (sleep 6.8G"'
 check "--wait names it"                eval 'eq "$(lease gpu --holder t10 --class llm --wait --timeout 3s)" 1 && grep -q "sleep 6.8G (not gaffer.s)" "$T/lease.out"'
+check "--pid: the holder's own process isn't foreign" eval 'eq "$(lease gpu --holder t10 --class llm --wait --timeout 3s --pid $fp)" 0 && grep -q "^gpu: refreshed to t10" "$T/lease.out" && ! grep -q "still on it" "$T/lease.out"'
+check "  the header shows the holder, not it" eval 'g leases | grep -q "pid $fp" && ! g ls | grep -q "sleep 6.8G"'
 kill -9 $fp; rm -f "$T/release.off"; lease gpu --holder t10 --release >/dev/null
 echo "999999 ghost 7000" > "$T/probe.procs"; echo 7000 > "$T/probe.used"; sleep 4
 check "a dead pid in the probe is not a resident" eval 'eq "$(lease gpu --holder t11 --class llm --wait --timeout 5s)" 0'

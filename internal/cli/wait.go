@@ -61,7 +61,7 @@ func waitLine(it proto.Item) string {
 		parts = append(parts, fmt.Sprintf("step %d/%d %s", it.Step+1, len(it.Spec.Steps), it.StepName))
 	}
 	if p := it.Progress; p != nil && p.Total > 0 && it.State != proto.SDone {
-		parts = append(parts, fmt.Sprintf("%.0f%% %g/%g %s", min(1, p.Done/p.Total)*100, p.Done, p.Total, unit(it)))
+		parts = append(parts, fmt.Sprintf("%.0f%% %s", min(1, p.Done/p.Total)*100, ofTotal(p.Done, p.Total, unit(it))))
 	}
 	if it.ETA > 0 && active(it.State) {
 		parts = append(parts, "eta "+fmtDur(it.ETA))
