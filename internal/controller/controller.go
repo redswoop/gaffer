@@ -327,6 +327,7 @@ func (c *Controller) running(it *rec, r proto.JobReport, host string) {
 	}
 	if it.State == proto.SAssigned {
 		it.State, it.Reason, it.RejectHost, it.RejectUntil, it.YieldedAt, it.PreemptUntil = proto.SRunning, "", "", 0, 0, 0
+		it.RunSince, it.StallAlerted = nowMS(), false // a new attempt: the stall clock restarts, not from a progress before a yield/pause
 		if it.StopMode != "" {
 			it.State = proto.SStopping
 		}
@@ -746,8 +747,15 @@ func (c *Controller) monitor() {
 }
 
 func (c *Controller) lastMove(it *rec) int64 {
-	if it.Progress != nil && it.Progress.TS > 0 {
-		return it.Progress.TS
+	m := int64(0)
+	if it.Progress != nil {
+		m = it.Progress.TS
+	}
+	if it.RunSince > m { // progress from before this attempt started (it sat yielded/paused since) is not "no movement"
+		m = it.RunSince
+	}
+	if m > 0 {
+		return m
 	}
 	if it.Started > 0 {
 		return it.Started

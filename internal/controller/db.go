@@ -41,12 +41,13 @@ type rec struct {
 	PausedBoot     string // the boot a shutdown pause happened in: a new boot means the host is back
 	YieldRes       string // yielded / stopping for a yield: the resource given up
 	PreemptUntil   int64  // a would-be preemptor that didn't start after its victim yielded waits this long before bumping again
+	RunSince       int64  // when the current attempt began running (ms): the stall clock starts here, not at a pre-yield progress
 }
 
 const cols = `id, kind, title, state, host, attempt, retries, step, step_name, priority, reason, attention, attention_acked,
   observed, progress, checkpoint, resume, stop_mode, affinity, stall_alerted, reject_host, reject_until, created, started,
   finished, updated, spec, source, ext_key, parent, offers, acked, paused_by, paused_boot, run_ms, yielded_at, yield_to,
-  yield_res, preempt_until`
+  yield_res, preempt_until, run_since`
 
 func openDB(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
@@ -62,7 +63,7 @@ func openDB(path string) (*sql.DB, error) {
 		"items paused_by TEXT DEFAULT ''", "items paused_boot TEXT DEFAULT ''", "items run_ms INT DEFAULT 0",
 		"items yielded_at INT DEFAULT 0", "items yield_to TEXT DEFAULT ''", "items yield_res TEXT DEFAULT ''",
 		"items preempt_until INT DEFAULT 0", "hosts hold TEXT DEFAULT ''", "hosts leases TEXT DEFAULT '[]'",
-		"hosts resources TEXT DEFAULT '{}'"} { // added after v0
+		"hosts resources TEXT DEFAULT '{}'", "items run_since INT DEFAULT 0"} { // added after v0
 		table, def, _ := strings.Cut(col, " ")
 		db.Exec("ALTER TABLE " + table + " ADD COLUMN " + def) // fails harmlessly once it exists
 	}
@@ -84,7 +85,7 @@ func scanRec(s scanner) (*rec, error) {
 	err := s.Scan(&r.ID, &r.Kind, &r.Title, &r.State, &r.Host, &r.Attempt, &r.Retries, &r.Step, &r.StepName, &r.Priority,
 		&r.Reason, &r.Attention, &r.AttentionAcked, &r.Observed, &prog, &cp, &r.Resume, &r.StopMode, &r.Affinity,
 		&r.StallAlerted, &r.RejectHost, &r.RejectUntil, &r.Created, &r.Started, &r.Finished, &r.Updated, &spec, &r.Source, &r.Key, &r.Parent, &r.Offers, &r.Acked,
-		&r.PausedBy, &r.PausedBoot, &r.RunMS, &r.YieldedAt, &r.YieldTo, &r.YieldRes, &r.PreemptUntil)
+		&r.PausedBy, &r.PausedBoot, &r.RunMS, &r.YieldedAt, &r.YieldTo, &r.YieldRes, &r.PreemptUntil, &r.RunSince)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +149,7 @@ func (c *Controller) put(r *rec) {
 		r.Kind, r.Title, r.State, r.Host, r.Attempt, r.Retries, r.Step, r.StepName, r.Priority, r.Reason, r.Attention,
 		r.AttentionAcked, r.Observed, prog, cp, r.Resume, r.StopMode, r.Affinity, r.StallAlerted, r.RejectHost,
 		r.RejectUntil, r.Created, r.Started, r.Finished, r.Updated, js(r.Spec), r.Source, r.Key, r.Parent, r.Offers, r.Acked,
-		r.PausedBy, r.PausedBoot, r.RunMS, r.YieldedAt, r.YieldTo, r.YieldRes, r.PreemptUntil, r.ID)
+		r.PausedBy, r.PausedBoot, r.RunMS, r.YieldedAt, r.YieldTo, r.YieldRes, r.PreemptUntil, r.RunSince, r.ID)
 	if err != nil {
 		logf("put #%d: %v", r.ID, err)
 	}
